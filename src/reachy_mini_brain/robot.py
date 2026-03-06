@@ -22,6 +22,7 @@ _TIMEOUT = 30  # seconds — goto blocks for the full movement duration
 _RETRIES = 2
 _READY_CACHE_TTL = 10  # seconds — skip re-checking if we confirmed ready recently
 _last_ready_at = 0.0
+_session_active = False  # set by Session — skips ensure_ready() since session already confirmed
 
 
 def _base_url():
@@ -84,6 +85,8 @@ def ensure_ready():
     Call this before any move command. Idempotent — cached for 10s.
     """
     global _last_ready_at
+    if _session_active:
+        return  # session already confirmed ready
     if time.time() - _last_ready_at < _READY_CACHE_TTL:
         return  # recently confirmed ready, skip
     status = _get("/api/daemon/status")

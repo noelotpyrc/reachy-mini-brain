@@ -75,46 +75,35 @@ Scaffold the project and get Claude seeing through the camera and moving the rob
 
 **Milestone:** In Claude Code, say "take a photo and describe what you see, then nod" → it works.
 
-### Phase 2: Hear + Speak
-Add audio: speech-to-text and text-to-speech through the robot.
+### Phase 1.5: Voice + Video CLI
+Basic audio and video commands, same fire-and-forget pattern as Phase 1.
 
-- `stt.py` — faster-whisper wrapper
-- `tts.py` — piper-tts wrapper
-- `audio.py` — `listen`, `speak`, `doa`
-- Update CLAUDE.md with audio commands
+- `stt.py` — faster-whisper wrapper (local STT)
+- `tts.py` — piper-tts wrapper (local TTS, voice auto-download)
+- `audio.py` — `listen`, `speak`, `play-sound`, `doa`
+- `video.py` — `record`
 
 **Milestone:** "Listen for 5 seconds and tell me what you heard, then say it back" → works.
+
+### Phase 2: Persistent Channels + Multi-Channel
+Keep all channels alive so the robot can see, talk, and move concurrently.
+
+- Eliminate 30-60s WebRTC cold start per call
+- Multiple channels active simultaneously
+- Approach TBD (session daemon, persistent SDK process, or connection pooling)
+
+**Milestone:** Take a photo while speaking — both complete in <1s.
 
 ### Phase 3: Voice Conversation
 Continuous hands-free conversation mode.
 
-- `scripts/voice_conversation.py` — persistent mic stream + VAD + STT → Claude → TTS loop
-
-```
-Robot audio stream (persistent connection)
-    ↓
-VAD (silero-vad) — detects speech start/end
-    ↓ on utterance end
-faster-whisper STT → transcript
-    ↓
-claude --resume SESSION -p "User: {transcript}"
-    ↓ Claude calls speak/move via Bash
-piper TTS → robot speaker
-    ↓
-Loop — ready for next utterance
-```
-
-**Why persistent:** The mic stream must stay open. Closing and reopening per turn creates audible gaps and misses speech.
+- `scripts/voice_conversation.py` — persistent mic + VAD + STT → Claude → TTS loop
 
 **Milestone:** Speak to robot freely, Claude responds via speaker, multi-turn conversation.
 
 ### Phase 4: Scheduled Monitoring
-Periodic environment checks.
-
-- `scripts/cron_check.sh` — cron wrapper calling `claude -p "..." --resume`
+- `scripts/cron_check.sh` — cron wrapper
 - Logging and alerting setup
-
-**Milestone:** Robot takes a photo every 30 min, Claude logs observations.
 
 ### Phase 5: Polish
 - Error handling, reconnection logic
@@ -162,16 +151,22 @@ All commands: `.venv/bin/python -m reachy_mini_brain.<module> <command>`
 ### vision.py
 | Command | Args | Notes |
 |---------|------|-------|
-| `take-photo` | `--out PATH` | Default: `/tmp/reachy_photo.jpg` |
+| `take-photo` | `--out PATH --resolution 720p\|1080p\|4k\|max` | Default: `artifacts/reachy_photo.jpg`, 720p |
 
 ### state.py
 | Command | Args | Notes |
 |---------|------|-------|
 | `get-state` | — | Prints full state as JSON |
 
-### audio.py (Phase 2)
+### audio.py
 | Command | Args | Notes |
 |---------|------|-------|
-| `listen` | `--duration SEC` | STT, prints transcript |
-| `speak` | `TEXT` | TTS through robot speaker |
-| `doa` | — | Direction of arrival + speech detection |
+| `listen` | `--duration SEC --model base\|small --language CODE` | Mic → STT → prints transcript |
+| `speak` | `TEXT --voice NAME` | TTS → robot speaker via WebRTC |
+| `play-sound` | `PATH` | Play WAV through robot speaker |
+| `doa` | — | Direction of arrival JSON |
+
+### video.py
+| Command | Args | Notes |
+|---------|------|-------|
+| `record` | `--duration SEC --out PATH --resolution 720p\|1080p` | Record to MP4 |
