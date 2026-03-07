@@ -85,6 +85,11 @@ class Session:
         """Graceful shutdown — close media pipelines and disconnect."""
         if self._mini is None:
             return
+        # Stop listener thread if running
+        if hasattr(self, "_listen_stop"):
+            self._listen_stop.set()
+            if hasattr(self, "_listen_thread"):
+                self._listen_thread.join(timeout=5)
         try:
             self._mini.media_manager.close()
         except Exception:
@@ -212,6 +217,10 @@ class Session:
         if audio.ndim > 1:
             audio = audio[:, 0]
 
+        # Flag so listener thread discards mic input during playback
+        if hasattr(self, "_speaking"):
+            self._speaking = True
+
         # Push in chunks, paced to real-time
         chunk_size = 320
         for i in range(0, len(audio), chunk_size):
@@ -220,6 +229,76 @@ class Session:
             time.sleep(chunk_size / 16000 * 0.9)
 
         time.sleep(0.5)  # let final chunks play out
+
+        if hasattr(self, "_speaking"):
+            self._speaking = False
+
+    # --- Continuous listening ---
+
+    def listen_start(self, model: str = "base", language: str = "en") -> str:
+        """Start continuous background listening.
+
+        A daemon thread buffers raw audio from the mic.
+        Call listen_read() to transcribe and retrieve what's been said.
+        """
+        self._check()
+        if hasattr(self, "_listen_thread") and self._listen_thread.is_alive():
+            return "already listening"
+
+        self._listen_stop = threading.Event()
+        self._listen_buffer: list[np.ndarray] = []
+        self._listen_lock = threading.Lock()
+        self._listen_model = model
+        self._listen_language = language
+        self._speaking = False  # set by speak() to flag own-voice audio
+        self._listen_thread = threading.Thread(
+            target=self._listen_loop, daemon=True,
+        )
+        self._listen_thread.start()
+        return "listening"
+
+    def listen_read(self) -> str:
+        """Transcribe and return buffered audio, then clear the buffer.
+
+        Returns transcript string (empty if silence/nothing buffered).
+        """
+        if not hasattr(self, "_listen_lock"):
+            return ""
+
+        with self._listen_lock:
+            chunks = list(self._listen_buffer)
+            self._listen_buffer.clear()
+
+        if not chunks:
+            return ""
+
+        from reachy_mini_brain import stt
+
+        audio = np.concatenate(chunks)
+        if audio.ndim > 1:
+            audio = audio[:, 0]
+
+        lang = None if self._listen_language == "auto" else self._listen_language
+        return stt.transcribe_array(
+            audio, sample_rate=16000, model_size=self._listen_model, language=lang,
+        )
+
+    def listen_stop(self) -> str:
+        """Stop continuous background listening."""
+        if hasattr(self, "_listen_stop"):
+            self._listen_stop.set()
+            if hasattr(self, "_listen_thread"):
+                self._listen_thread.join(timeout=10)
+        return "stopped"
+
+    def _listen_loop(self) -> None:
+        """Background thread: buffer raw audio samples from the mic."""
+        while not self._listen_stop.is_set():
+            sample = self._mini.media.get_audio_sample()
+            if sample is not None and not self._speaking:
+                with self._listen_lock:
+                    self._listen_buffer.append(sample)
+            time.sleep(0.01)
 
     # --- Motion ---
 
@@ -310,6 +389,12 @@ class Session:
 _REMOTE_METHODS = {
     "speak", "listen", "nod", "shake", "look", "take_photo",
     "move_head", "rotate_body", "antennas", "get_state", "status",
+    "listen_start", "listen_read", "listen_stop",
+}
+
+# Aliases for convenience
+_METHOD_ALIASES = {
+    "health": "status",
 }
 
 
@@ -336,6 +421,8 @@ def _handle_connection(session: Session, conn: socket.socket) -> bool:
         if method == "stop":
             _send(conn, {"ok": True, "result": "stopping"})
             return False
+
+        method = _METHOD_ALIASES.get(method, method)
 
         if method not in _REMOTE_METHODS:
             _send(conn, {"ok": False, "error": f"unknown method: {method}"})

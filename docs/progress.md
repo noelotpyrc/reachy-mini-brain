@@ -124,6 +124,8 @@ Direction of Arrival uses the ReSpeaker 4-mic array which is connected to the RP
 
 ### What was built
 - **`session.py`** — `Session` class + Unix-socket server. Holds a single long-lived `ReachyMini()` SDK instance, exposing vision, audio, motion, and state through one unified API. Background server mode (`serve`) accepts commands from any process via `call`.
+- **Continuous listening** — `listen_start`/`listen_read`/`listen_stop`. Background thread buffers raw mic audio; transcription (STT) runs on-demand when `listen_read` is called. Enables voice conversation without fixed recording durations.
+- **Voice conversation flow** — Claude Code acts as the robot's brain, driving listen→think→speak→act loops by polling `listen_read` and issuing commands through the session server. See `docs/continuous-listen.md` for full design.
 
 ### Key decisions & discoveries
 
@@ -147,17 +149,45 @@ Camera + audio both go through the same `GstWebRTCClient`. One `ReachyMini()` in
 
 `robot.goto()` calls `ensure_ready()` which makes HTTP requests to check daemon/backend/motor status. With a 10s cache TTL, this re-triggers after the long WebRTC warmup in `Session.start()`, adding noticeable delay to every motion command. Fix: `robot._session_active` flag bypasses `ensure_ready()` entirely while a session is active, since the session already confirmed readiness at startup.
 
+**21. Continuous listening — dumb buffer + on-demand STT**
+
+Fixed-duration `listen(5)` means the mic is off while Claude thinks or the robot speaks — anything said is lost. Solution: a daemon thread that continuously calls `get_audio_sample()` and appends to a buffer. STT only runs when `listen_read` is called. The thread does zero processing — just accumulates raw samples. `speak()` sets a `_speaking` flag so the thread discards samples of the robot's own voice.
+
+**22. Claude Code IS the brain — no separate conversation script**
+
+Instead of building a `voice_conversation.py` script that calls the Claude API, Claude Code itself drives the robot through the session server's `call` interface. This means:
+- No separate API key management or conversation history code
+- Claude Code's full reasoning, tool use, and context window are the robot's intelligence
+- The session server is just a tool — like a file editor or terminal, but for a robot
+- Polling pattern: `sleep 5 && call listen_read` lets Claude Code autonomously check for voice input
+
 ### Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `src/reachy_mini_brain/session.py` | ~330 | Session class, Unix socket server/client, CLI (serve/call) |
+| `src/reachy_mini_brain/session.py` | ~580 | Session class, continuous listening, Unix socket server/client, CLI (serve/call) |
+| `docs/continuous-listen.md` | ~95 | Continuous listening design doc |
 
 ---
 
-## Phase 3: Voice Conversation — NOT STARTED
+## Phase 3: Voice Conversation ✅ COMPLETE (via Claude Code)
 
-- [ ] `scripts/voice_conversation.py` — persistent mic + VAD + STT → Claude → TTS loop
+Originally planned as a standalone `voice_conversation.py` script. Realized Claude Code itself is the better brain — it already has reasoning, conversation history, tool use, and multi-modal understanding. No separate script needed.
+
+### How it works
+
+1. Start session server: `python -m reachy_mini_brain.session serve`
+2. Claude Code issues `call listen_start` to begin background mic buffering
+3. Claude Code polls with `sleep 5 && call listen_read` to get transcripts
+4. Based on what's heard, Claude Code responds via `call speak "..."`, executes actions (`call look left`, `call nod`, `call take_photo`), and describes what the camera sees
+5. User says "stop" in chat or verbally → Claude Code calls `listen_stop`
+
+### What's available for future improvement
+
+- [ ] VAD (voice activity detection) — know when someone starts/stops talking
+- [ ] Wake word detection — "hey reachy" trigger
+- [ ] Echo cancellation — hardware-level filtering of robot's own voice
+- [ ] Streaming STT — transcribe as audio arrives instead of in batches
 
 ---
 
