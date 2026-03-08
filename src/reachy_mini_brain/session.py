@@ -257,20 +257,22 @@ class Session:
         self._listen_thread.start()
         return "listening"
 
-    def listen_read(self) -> str:
+    def listen_read(self) -> dict:
         """Transcribe and return buffered audio, then clear the buffer.
 
-        Returns transcript string (empty if silence/nothing buffered).
+        Returns {"text": str, "buffer_duration": float}.
+        buffer_duration is seconds of audio in the chunk.
+        Empty text if silence/nothing buffered.
         """
         if not hasattr(self, "_listen_lock"):
-            return ""
+            return {"text": "", "buffer_duration": 0.0}
 
         with self._listen_lock:
             chunks = list(self._listen_buffer)
             self._listen_buffer.clear()
 
         if not chunks:
-            return ""
+            return {"text": "", "buffer_duration": 0.0}
 
         from reachy_mini_brain import stt
 
@@ -278,10 +280,13 @@ class Session:
         if audio.ndim > 1:
             audio = audio[:, 0]
 
+        buffer_duration = round(len(audio) / 16000.0, 2)
+
         lang = None if self._listen_language == "auto" else self._listen_language
-        return stt.transcribe_array(
+        text = stt.transcribe_array(
             audio, sample_rate=16000, model_size=self._listen_model, language=lang,
         )
+        return {"text": text, "buffer_duration": buffer_duration}
 
     def listen_stop(self) -> str:
         """Stop continuous background listening."""
@@ -538,9 +543,9 @@ def serve():
     serve_session()
 
 
-@cli.command()
+@cli.command(context_settings={"ignore_unknown_options": True})
 @click.argument("method")
-@click.argument("args", nargs=-1)
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def call(method, args):
     """Send a command to the running session server.
 

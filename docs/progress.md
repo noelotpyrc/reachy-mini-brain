@@ -191,15 +191,97 @@ Originally planned as a standalone `voice_conversation.py` script. Realized Clau
 
 ---
 
-## Phase 4: Scheduled Monitoring — NOT STARTED
+## Phase 4: Meeting Assistant ✅ COMPLETE
 
-- [ ] `scripts/cron_check.sh`
-- [ ] Logging setup
+Robot sits in meetings as a silent assistant — listens by default, acts when triggered.
+
+### What was built
+- **`transcribe.py`** — Background transcription script. Runs alongside session server. Every 5s: grabs audio buffer → STT → appends timestamped entry to transcript file → checks for trigger word → spawns `cla` agent on match.
+- **Modular trigger matching** — `TriggerMatcher` ABC with pluggable algorithms. First implementation: `VariantsMatcher` — hardcoded set of known Whisper mistranscriptions of "Reachy" (richie, reggie, regina, rachel, etc.). Factory function `get_matcher()` selects matcher; falls back to `ExactMatcher` for custom trigger words.
+- **`cla` agent dispatch** — On trigger, spawns a headless Claude Code session (`cla`) that reads the transcript, verifies the trigger is real, researches the answer (web search), and speaks back through the robot. Each agent is independent and non-blocking.
+- **`listen_read` returns buffer_duration** — Session server's `listen_read` now returns `{"text": str, "buffer_duration": float}` so the transcription script can record how much audio each chunk contained.
+
+### Architecture
+
+```
+Terminal 1: session serve                (session server, stays alive)
+Terminal 2: transcribe.py               (transcription + trigger detection, runs forever)
+            └── spawns cla agents       (on-demand, one per triggered question)
+                ├── read transcript
+                ├── speak "working on it"
+                ├── sleep + re-read transcript
+                ├── web search / research
+                ├── speak answer
+                └── exit
+```
+
+### Key decisions & discoveries
+
+**23. Whisper consistently mishears "Reachy"**
+
+Whisper (base model, English) never once transcribed "Reachy" correctly across dozens of live attempts. Most common outputs: "Reggie" (dominant), "Richie", "Regina", "Rachel". Occasionally produces completely unrelated words like "Energy" or "Here a cheek". The `VariantsMatcher` handles the phonetically-similar cases; the unrelated ones are unsolvable with word-level matching.
+
+**24. `cla` nested session protection**
+
+`cla` refuses to launch inside another Claude Code session (checks `CLAUDECODE` env var). When `transcribe.py` is launched from Claude Code, this var is inherited. Fix: strip `CLAUDECODE` from the subprocess env.
+
+**25. `cla` permission model — `acceptEdits` + `--allowed-tools`**
+
+The spawned `cla` agent needs: (a) Read access to the transcript file, (b) Bash access for session commands and sleep, (c) WebSearch/WebFetch for research. `--permission-mode acceptEdits` grants Read within the project directory. `--allowed-tools` whitelists specific Bash patterns and web tools. Transcript file must be inside the project dir (not `/tmp/`) for Read to work.
+
+**26. Trigger cooldown prevents duplicate agents**
+
+Without cooldown, saying "Hey Reachy" once often produces trigger words in consecutive 5s chunks (e.g. "Reggie" in cycle 5 and "Richie" in cycle 6), spawning two agents that both say "I'm working on it". A 60-second cooldown after each trigger suppresses subsequent matches.
+
+**27. `cla` agent cost and latency**
+
+Each triggered agent takes ~60s end-to-end and costs ~$0.12–0.14 (Sonnet). Breakdown: ~5–10s cold start, ~5s first API call (read transcript + acknowledge), 10s deliberate sleep, ~5s second API call (re-read + research), ~5–10s web search + final API call + speak. The acknowledgment ("I'm working on it") takes ~15–18s from trigger word — dominated by cla cold start.
+
+### Known issues
+
+- **STT reliability**: Whisper sometimes produces completely unrelated words for "Reachy" (e.g. "Energy", "Here a cheek") that no word-variant list can catch. Would need phonetic matching or a dedicated wake word model.
+- **Acknowledgment latency**: ~15–18s from saying "Hey Reachy" to hearing "I'm working on it". Bottleneck is `cla` agent cold start (~5–10s) + first API round-trip.
+- **Cost**: ~$0.13 per triggered question. Fine for demos, expensive for all-day meetings.
+- **No motion during responses**: The `cla` agent only speaks — doesn't nod, look around, or use body language. Could add motion commands to the system prompt.
+
+### Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/reachy_mini_brain/transcribe.py` | ~310 | Transcription loop, trigger matchers, cla agent dispatch |
 
 ---
 
-## Phase 5: Polish — NOT STARTED
+## Phase 5: Conversation App with Vision — NOT STARTED
 
-- [ ] Error handling, reconnection
-- [ ] Personas, wake words
-- [ ] Mockup sim tests
+Standalone app (like Pollen's official conversation app) but with vision. Runs independently without Claude Code driving the loop.
+
+- [ ] Claude API integration for LLM reasoning
+- [ ] Conversation history management
+- [ ] Continuous listen → STT → Claude API → TTS → speak loop
+- [ ] Vision integration: periodic or on-demand photos included in LLM context
+- [ ] Proactive visual awareness (react to changes in what the camera sees)
+- [ ] Expressive behaviors: combine motion + speech (nod while agreeing, look toward speaker)
+
+---
+
+## Phase 6: Autonomous Agent — NOT STARTED
+
+Headless agent that runs on its own with a goal, no human in the loop.
+
+- [ ] `cla`-based agent with system prompt defining robot behavior
+- [ ] Goal-driven operation (e.g. "greet visitors", "guard the room", "language tutor")
+- [ ] Self-directed listen → think → act loop
+- [ ] Graceful recovery from errors and context limits
+
+---
+
+## Phase 7: Memory System — NOT STARTED
+
+Persistent memory that survives agent restarts and context window limits.
+
+- [ ] Session server as memory store (outlives the agent)
+- [ ] `save_memory` / `get_memory` commands
+- [ ] Conversation history persistence
+- [ ] People recognition (remember faces, names, preferences)
+- [ ] Long-term knowledge accumulation across sessions

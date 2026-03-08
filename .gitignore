@@ -3,3 +3,4 @@ __pycache__/
 *.egg-info/
 artifacts/
 .pytest_cache/
+reachy_transcript.txt
