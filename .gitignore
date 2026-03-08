@@ -4,3 +4,4 @@ __pycache__/
 artifacts/
 .pytest_cache/
 reachy_transcript.txt
+.DS_Store
