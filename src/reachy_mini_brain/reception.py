@@ -155,6 +155,11 @@ class ReceptionDaemon:
         self._record_writer = None
         self._record_frames = 0
 
+        # live MJPEG stream of the vision worker's frames (view via an ssh tunnel)
+        self._streaming = False
+        self._latest_frame = None
+        self._stream_server = None
+
     # --- lifecycle ---
 
     def start(self):
@@ -207,6 +212,7 @@ class ReceptionDaemon:
                 if frame is None:
                     log.info("vision: no frame yet")
                 else:
+                    self._latest_frame = frame  # published for the MJPEG stream
                     if self._recording:
                         self._write_video(frame)
                     if pipe is not None and hasattr(frame, "ndim"):
@@ -313,6 +319,61 @@ class ReceptionDaemon:
             self._record_frames += 1
         except Exception as e:  # noqa: BLE001
             log.warning("record: write error %s", e)
+
+    # --- live MJPEG stream (debug: view what vision sees, over an ssh tunnel) ---
+
+    def stream_on(self) -> str:
+        """Serve the vision worker's latest frame as MJPEG on localhost:8090 (needs vision on).
+        View via tunnel: `ssh -L 8090:localhost:8090 <m1max>` then http://localhost:8090."""
+        port = 8090
+        with self._lock:
+            if self._streaming:
+                return f"already streaming on :{port}"
+            import cv2
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            daemon = self
+
+            class _Handler(BaseHTTPRequestHandler):
+                def log_message(self, *a):  # keep the daemon log quiet
+                    pass
+
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                    self.end_headers()
+                    while daemon._streaming:
+                        frame = daemon._latest_frame
+                        ok = False
+                        if frame is not None:
+                            ok, jpg = cv2.imencode(".jpg", frame)
+                        if not ok:
+                            time.sleep(0.1)
+                            continue
+                        try:
+                            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                            self.wfile.write(jpg.tobytes())
+                            self.wfile.write(b"\r\n")
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+                        time.sleep(0.15)
+
+            self._stream_server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+            self._stream_server.daemon_threads = True
+            self._streaming = True
+            threading.Thread(target=self._stream_server.serve_forever, name="stream", daemon=True).start()
+        log.info("stream: MJPEG on 127.0.0.1:%d", port)
+        return f"streaming on :{port} — ssh -L {port}:localhost:{port} <m1max>, then http://localhost:{port}"
+
+    def stream_off(self) -> str:
+        with self._lock:
+            self._streaming = False
+            srv, self._stream_server = self._stream_server, None
+        if srv is not None:
+            srv.shutdown()
+            srv.server_close()
+        log.info("stream: stopped")
+        return "stream off"
 
     # --- voice toggle ---
 
@@ -427,7 +488,8 @@ def _alive(t: threading.Thread | None) -> bool:
 
 # daemon methods callable over the socket
 _COMMANDS = {"vision_on", "vision_off", "voice_on", "voice_off", "status", "react",
-             "farewell", "capture_on", "capture_off", "record_on", "record_off"}
+             "farewell", "capture_on", "capture_off", "record_on", "record_off",
+             "stream_on", "stream_off"}
 
 
 def _send(conn: socket.socket, obj: dict):
@@ -635,6 +697,13 @@ def capture(state):
 def record(state):
     """Record the camera to artifacts/video-*.mp4 (needs vision on)."""
     _run_client(f"record_{state}")
+
+
+@cli.command()
+@click.argument("state", type=click.Choice(["on", "off"]))
+def stream(state):
+    """Toggle a live MJPEG camera stream on localhost:8090 (needs vision on)."""
+    _run_client(f"stream_{state}")
 
 
 @cli.command()
