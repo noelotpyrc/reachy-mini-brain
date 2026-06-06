@@ -13,14 +13,22 @@ uv pip install -e ".[audio]"   # for listen/speak commands
 
 ```
 src/reachy_mini_brain/
-├── robot.py     # REST API client (urllib, no SDK)
-├── motion.py    # CLI: wake-up, sleep, move-head, look, nod, shake, antennas
-├── vision.py    # CLI: take-photo (SDK WebRTC camera)
-├── audio.py     # CLI: listen, speak, play-sound, doa (SDK WebRTC audio)
-├── video.py     # CLI: record (SDK WebRTC + OpenCV)
-├── stt.py       # faster-whisper wrapper (local STT)
-├── tts.py       # piper-tts wrapper (local TTS)
-└── state.py     # CLI: get-state
+├── robot.py         # REST API client (urllib, no SDK)
+├── motion.py        # CLI: wake-up, sleep, move-head, look, nod, shake, antennas
+├── vision.py        # CLI: take-photo (SDK WebRTC camera)
+├── audio.py         # CLI: listen, speak, play-sound, doa (SDK WebRTC audio)
+├── video.py         # CLI: record (SDK WebRTC + OpenCV)
+├── stt.py           # faster-whisper wrapper (local STT)
+├── tts.py           # piper-tts wrapper (local TTS, en_US-lessac-medium)
+├── state.py         # CLI: get-state
+├── session.py       # persistent ReachyMini() session + Unix-socket server
+│                     #  — reception robot (docs/plan-reception.md) —
+├── reception.py     # resident daemon: vision/voice/brain toggles + control socket
+├── detector.py      # RF-DETR Nano person detection (vision tier-1)
+├── approach.py      # ByteTrack + approach-vs-transit geometry (tiers 2-3)
+├── perception.py    # detect → track → approach → events.jsonl
+├── alert_engine.py  # separate process: tails events → robot greets
+└── brain.py         # claude -p receptionist agent (voice brain)
 ```
 
 ## Usage
@@ -44,6 +52,19 @@ src/reachy_mini_brain/
 
 # Read state
 .venv/bin/python -m reachy_mini_brain.state get-state
+```
+
+### Reception robot (Phases A–C — see `docs/plan-reception.md`)
+
+```bash
+# Resident daemon: vision (approach detection) + voice (claude -p brain)
+.venv/bin/python -m reachy_mini_brain.reception serve --perception --brain
+# Toggle workers + greet, from another shell:
+.venv/bin/python -m reachy_mini_brain.reception vision on
+.venv/bin/python -m reachy_mini_brain.reception voice on
+.venv/bin/python -m reachy_mini_brain.reception status
+# Alert engine (separate process): approach → robot greets
+.venv/bin/python -m reachy_mini_brain.alert_engine
 ```
 
 See `docs/robot-guide.md` for the full CLI reference.

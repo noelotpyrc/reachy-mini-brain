@@ -18,6 +18,12 @@ audio = [
     "scipy",
     "pathvalidate",
 ]
+# Reception vision pipeline (Phase B). The voice brain (Phase C) shells out to the
+# `claude` CLI, so it needs no Python dependency here.
+vision = [
+    "rfdetr",
+    "supervision",
+]
 sim = ["reachy-mini[mujoco]"]
 dev = ["pytest", "ruff"]
 
