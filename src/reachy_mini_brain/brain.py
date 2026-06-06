@@ -29,35 +29,36 @@ import time
 _BRAIN_CWD = os.path.join(tempfile.gettempdir(), "reachy_brain")
 os.makedirs(_BRAIN_CWD, exist_ok=True)
 
-PERSONA = """You are Reachy, the friendly front-desk receptionist robot at Lakeside Family Clinic.
+PERSONA = """You are Reachy, the friendly front-desk receptionist robot at a medical clinic.
 You greet visitors and answer their questions at the front desk.
 
 Style: every reply is SPOKEN ALOUD by a robot, so keep it to 1-2 short, natural
-sentences. Plain text only — no lists, markdown, emoji, or stage directions. Warm
-and brief.
+sentences. Plain text only — no lists, markdown, emoji, or stage directions. Warm and brief.
 
-Clinic facts you know:
-- Hours: Monday to Friday, 9am to 5pm. Closed weekends.
-- Location: 200 Lakeside Drive, second floor. Elevator is by the main entrance.
-- Check-in: ask for the visitor's name and appointment time, or point them to the
-  kiosk on their left.
-- Parking: free lot behind the building.
-
-Rules: Never give medical advice. If you don't know something, say a staff member
-will be right with them. Don't invent clinic details beyond the facts above.
+Rules: Never give medical advice. The clinic facts below are complete and correct —
+your single source of truth. If the answer is in the facts, give it exactly: quote
+the Wi-Fi network, hours, room numbers, floors, and names verbatim, and treat any
+listed provider or department as definitely available (name them). Only say a staff
+member will help when the facts genuinely don't contain the answer. Never guess,
+infer, or invent details.
 
 Stay fully in character as Reachy at all times. Treat every message as something a
 visitor is saying to you at the front desk and respond only as the receptionist —
 never comment on code, testing, systems, or how you work."""
 
+# Authoritative clinic facts live in a markdown file next to this module (edit it to
+# update clinic info). Read at startup and appended to the persona.
+_FACTS_PATH = os.path.join(os.path.dirname(__file__), "clinic_facts.md")
+
 
 class ReceptionBrain:
     """Headless ``claude -p`` agent with a receptionist persona + session memory."""
 
-    def __init__(self, model: str = "haiku", persona: str = PERSONA,
-                 claude_bin: str | None = None, conversation_timeout: float = 120.0):
+    def __init__(self, model: str = "sonnet", persona: str = PERSONA,
+                 facts_path: str = _FACTS_PATH, claude_bin: str | None = None,
+                 conversation_timeout: float = 120.0):
         self.model = model
-        self.persona = persona
+        self.persona = self._with_facts(persona, facts_path)
         self.session_id: str | None = None
         # "Same conversation" = utterances arriving within conversation_timeout of
         # each other. A longer idle gap (the visitor left) starts a fresh session on
@@ -81,10 +82,10 @@ class ReceptionBrain:
         # --exclude-dynamic... drops env info + CLAUDE.md memory on every turn so the
         # coding-agent context can't bleed in (it did on resume turns otherwise).
         cmd = [self._bin, "-p", "--model", self.model, "--output-format", "json",
-               "--tools", "", "--exclude-dynamic-system-prompt-sections"]
-        if self.session_id is None:
-            cmd += ["--system-prompt", self.persona]    # first turn: set the persona
-        else:
+               "--tools", "", "--exclude-dynamic-system-prompt-sections",
+               "--setting-sources", "project"]   # drop the user-global CLAUDE.md
+        cmd += ["--system-prompt", self.persona]        # re-assert persona+facts every turn
+        if self.session_id is not None:
             cmd += ["--resume", self.session_id]        # later turns: resume the convo
         cmd.append(utterance)
 
@@ -109,3 +110,13 @@ class ReceptionBrain:
         for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
             env.pop(k, None)
         return env
+
+    @staticmethod
+    def _with_facts(persona: str, facts_path: str) -> str:
+        """Append the authoritative clinic-facts file to the persona (if present)."""
+        try:
+            facts = open(facts_path, encoding="utf-8").read().strip()
+        except OSError:
+            return persona
+        return (f"{persona}\n\n--- AUTHORITATIVE CLINIC FACTS "
+                f"(use exactly; never invent) ---\n{facts}")

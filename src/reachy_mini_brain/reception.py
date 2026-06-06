@@ -38,10 +38,12 @@ import socket
 import sys
 import threading
 import time
+from pathlib import Path
 
 import click
 
 SOCKET_PATH = "/tmp/reachy_mini_reception.sock"
+ARTIFACTS = Path(__file__).resolve().parent.parent.parent / "artifacts"
 
 log = logging.getLogger("reception")
 
@@ -123,13 +125,15 @@ class ReceptionDaemon:
                  voice_interval: float = 3.0, perception: bool = False,
                  threshold: float = 0.5,
                  greeting: str = "Hello! Welcome. Someone will be with you shortly.",
-                 brain: bool = False, brain_model: str = "haiku"):
+                 farewell: str = "Goodbye, have a nice day!",
+                 brain: bool = False, brain_model: str = "sonnet"):
         self._session = session
         self._vision_interval = vision_interval
         self._voice_interval = voice_interval
         self._perception_enabled = perception
         self._threshold = threshold
         self._greeting = greeting
+        self._farewell = farewell
         self._brain_enabled = brain
         self._brain_model = brain_model
         self._lock = threading.Lock()
@@ -138,6 +142,18 @@ class ReceptionDaemon:
         self._vision_stop: threading.Event | None = None
         self._voice_thread: threading.Thread | None = None
         self._voice_stop: threading.Event | None = None
+
+        # debug capture (records per-frame vision data for a manual test run)
+        self._capturing = False
+        self._capture_path: Path | None = None
+        self._capture_frames = 0
+        self._capture_events = 0
+
+        # video recording (persist the camera frames the vision worker grabs)
+        self._recording = False
+        self._record_path: Path | None = None
+        self._record_writer = None
+        self._record_frames = 0
 
     # --- lifecycle ---
 
@@ -179,18 +195,30 @@ class ReceptionDaemon:
                  self._vision_interval, self._perception_enabled)
         pipe = self._make_perception() if self._perception_enabled else None
         while not stop.is_set():
+            # Pause perception while the robot speaks — RF-DETR contends with the audio
+            # push thread (CPU/GIL) and makes speech choppy. Vision idles for the few
+            # seconds of a greeting/reply, then resumes. (First pass; the proper fix is
+            # to run perception in its own OS process so it never has to pause.)
+            if getattr(self._session, "_speaking", False):
+                stop.wait(0.1)
+                continue
             try:
                 frame = self._session.get_frame()
                 if frame is None:
                     log.info("vision: no frame yet")
-                elif pipe is not None and hasattr(frame, "ndim"):
-                    events, n = pipe.process(frame, bgr=True)
-                    if events:
-                        log.info("vision: %d person(s) | APPROACH %s", n, events)
-                    else:
-                        log.info("vision: %d person(s)", n)
                 else:
-                    log.info("vision: frame ok %s", tuple(frame.shape))
+                    if self._recording:
+                        self._write_video(frame)
+                    if pipe is not None and hasattr(frame, "ndim"):
+                        events, n, tracks = pipe.process(frame, bgr=True)
+                        if events:
+                            log.info("vision: %d person(s) | APPROACH %s", n, events)
+                        else:
+                            log.info("vision: %d person(s)", n)
+                        if self._capturing:
+                            self._write_capture(n, tracks, events)
+                    else:
+                        log.info("vision: frame ok %s", tuple(frame.shape))
             except Exception as e:  # noqa: BLE001 — keep the loop alive
                 log.warning("vision: error %s", e)
             stop.wait(self._vision_interval)
@@ -207,6 +235,84 @@ class ReceptionDaemon:
         except Exception as e:  # noqa: BLE001
             log.warning("vision: perception unavailable (%s) — frame-log only", e)
             return None
+
+    # --- capture toggle (debug: record per-frame vision data for a test run) ---
+
+    def capture_on(self) -> str:
+        """Start recording every vision frame's tracks/decisions to a fresh file."""
+        with self._lock:
+            self._capture_path = ARTIFACTS / f"capture-{time.strftime('%H%M%S')}.jsonl"
+            self._capture_path.parent.mkdir(parents=True, exist_ok=True)
+            self._capture_path.write_text("")
+            self._capture_frames = 0
+            self._capture_events = 0
+            self._capturing = True
+        log.info("capture: started -> %s", self._capture_path)
+        return f"capturing -> {self._capture_path}"
+
+    def capture_off(self) -> dict:
+        """Stop recording; return where the file is and what it caught."""
+        with self._lock:
+            self._capturing = False
+            summary = {
+                "path": str(self._capture_path) if self._capture_path else None,
+                "frames": self._capture_frames,
+                "events": self._capture_events,
+            }
+        log.info("capture: stopped (%s frames, %s events)",
+                 summary["frames"], summary["events"])
+        return summary
+
+    def _write_capture(self, n: int, tracks: list, events: list):
+        rec = {"ts": round(time.time(), 2), "n": n, "tracks": tracks, "events": events}
+        try:
+            with open(self._capture_path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            self._capture_frames += 1
+            self._capture_events += len(events)
+        except Exception as e:  # noqa: BLE001
+            log.warning("capture: write error %s", e)
+
+    # --- record toggle (persist the camera frames to an mp4) ---
+
+    def record_on(self) -> str:
+        """Record the frames the vision worker grabs to an mp4 (needs vision on).
+        Frame rate follows --vision-interval; lower it for smoother clips."""
+        with self._lock:
+            if self._recording:  # don't clobber an in-progress recording's writer
+                return f"already recording -> {self._record_path} ({self._record_frames} frames so far)"
+            self._record_path = ARTIFACTS / f"video-{time.strftime('%H%M%S')}.mp4"
+            self._record_path.parent.mkdir(parents=True, exist_ok=True)
+            self._record_writer = None  # lazy-created on first frame (needs w/h)
+            self._record_frames = 0
+            self._recording = True
+        fps = 1.0 / self._vision_interval if self._vision_interval else 5.0
+        log.info("record: started -> %s (~%.1f fps)", self._record_path, fps)
+        return f"recording -> {self._record_path}  (vision must be ON; ~{fps:.1f} fps)"
+
+    def record_off(self) -> dict:
+        with self._lock:
+            self._recording = False
+            writer, self._record_writer = self._record_writer, None
+            summary = {"path": str(self._record_path) if self._record_path else None,
+                       "frames": self._record_frames}
+        if writer is not None:
+            writer.release()
+        log.info("record: stopped (%s frames) -> %s", summary["frames"], summary["path"])
+        return summary
+
+    def _write_video(self, frame):
+        try:
+            if self._record_writer is None:
+                import cv2
+                h, w = frame.shape[:2]
+                fps = max(1.0, 1.0 / self._vision_interval) if self._vision_interval else 5.0
+                self._record_writer = cv2.VideoWriter(
+                    str(self._record_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            self._record_writer.write(frame)
+            self._record_frames += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("record: write error %s", e)
 
     # --- voice toggle ---
 
@@ -288,19 +394,27 @@ class ReceptionDaemon:
     # --- react (the alert engine triggers this) ---
 
     def react(self) -> str:
-        """Robot greets an approaching visitor: glance + antenna flick + speak."""
+        """Greet an approaching visitor."""
+        return self._express(self._greeting, "react: greeted visitor", "reacted")
+
+    def farewell(self) -> str:
+        """Say goodbye to a departing visitor."""
+        return self._express(self._farewell, "farewell: said goodbye", "farewelled")
+
+    def _express(self, message: str, done_log: str, result: str) -> str:
+        """Glance to center, flick antennas, speak, reset antennas."""
         for action in (
             lambda: self._session.look("center"),
             lambda: self._session.antennas(20, 20),
-            lambda: self._session.speak(self._greeting),
+            lambda: self._session.speak(message),
             lambda: self._session.antennas(0, 0),
         ):
             try:
                 action()
             except Exception as e:  # noqa: BLE001
-                log.warning("react: action error %s", e)
-        log.info("react: greeted visitor")
-        return "reacted"
+                log.warning("express: action error %s", e)
+        log.info(done_log)
+        return result
 
 
 def _alive(t: threading.Thread | None) -> bool:
@@ -312,7 +426,8 @@ def _alive(t: threading.Thread | None) -> bool:
 # ---------------------------------------------------------------------------
 
 # daemon methods callable over the socket
-_COMMANDS = {"vision_on", "vision_off", "voice_on", "voice_off", "status", "react"}
+_COMMANDS = {"vision_on", "vision_off", "voice_on", "voice_off", "status", "react",
+             "farewell", "capture_on", "capture_off", "record_on", "record_off"}
 
 
 def _send(conn: socket.socket, obj: dict):
@@ -355,7 +470,7 @@ def _handle(daemon: ReceptionDaemon, conn: socket.socket) -> bool:
 
 def serve_daemon(mock: bool, vision_interval: float, voice_interval: float,
                  perception: bool = False, threshold: float = 0.5,
-                 brain: bool = False, brain_model: str = "haiku"):
+                 brain: bool = False, brain_model: str = "sonnet"):
     """Start the reception daemon + control socket (blocks until shutdown)."""
     if mock:
         session = MockSession()
@@ -469,7 +584,7 @@ def cli():
 @click.option("--threshold", default=0.5, help="Detector confidence threshold.")
 @click.option("--brain/--no-brain", default=False,
               help="Route heard speech to the claude -p receptionist brain and speak the reply.")
-@click.option("--brain-model", default="haiku", help="Brain model (e.g. haiku, sonnet).")
+@click.option("--brain-model", default="sonnet", help="Brain model (e.g. sonnet, haiku, opus).")
 def serve(mock, vision_interval, voice_interval, perception, threshold, brain, brain_model):
     """Run the reception daemon (blocks until `shutdown` or Ctrl-C)."""
     logging.basicConfig(
@@ -500,6 +615,26 @@ def voice(state):
 def react():
     """Trigger the robot's greeting reaction (normally called by the alert engine)."""
     _run_client("react")
+
+
+@cli.command()
+def farewell():
+    """Trigger the robot's goodbye (normally the alert engine fires this on departure)."""
+    _run_client("farewell")
+
+
+@cli.command()
+@click.argument("state", type=click.Choice(["on", "off"]))
+def capture(state):
+    """Record per-frame vision data to artifacts/capture-*.jsonl for a test run."""
+    _run_client(f"capture_{state}")
+
+
+@cli.command()
+@click.argument("state", type=click.Choice(["on", "off"]))
+def record(state):
+    """Record the camera to artifacts/video-*.mp4 (needs vision on)."""
+    _run_client(f"record_{state}")
 
 
 @cli.command()

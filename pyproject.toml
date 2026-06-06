@@ -27,6 +27,9 @@ vision = [
 sim = ["reachy-mini[mujoco]"]
 dev = ["pytest", "ruff"]
 
+[project.scripts]
+reception = "reachy_mini_brain.reception:cli"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

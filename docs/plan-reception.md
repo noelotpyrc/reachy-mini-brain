@@ -168,6 +168,36 @@ they can proceed in parallel once A lands.
 
 ---
 
+## Testing strategy — semi-live (video) → live (robot)
+
+Two stages, cheapest first. **Do not burn a live robot session to test logic a video
+can exercise** — we learned this hand-tuning approach thresholds in real time.
+
+**Stage 1 — Semi-live (video-driven).** Feed a recorded video into the perception
+pipeline in place of the live camera; the full chain runs identically
+(detect → track → approach → event → react). `perception.process(frame)` is already
+source-agnostic (validated ~23 fps on `reachy_video.mp4`), so this only needs a
+frame-source switch (camera vs file). Two sub-modes:
+- **Assert mode** (no robot, dev venv / CI) — a library of *labelled scenario clips*,
+  each with an expected event count = a regression suite for the perception + approach
+  logic. Tune thresholds against these, not against the robot:
+  - `approach.mp4` → expect **1** approach event
+  - `walk-by.mp4` (transit across frame) → expect **0**
+  - `sitting-fidget.mp4` (stationary person moving hands/head) → expect **0**  ← a real false-positive we hit live
+  - `two-people.mp4`, `empty.mp4` → expected counts
+- **Robot-reacts mode** (robot present, video input) — e.g. `serve --perception
+  --video clip.mp4`: the real robot greets in response to the clip, exercising motion +
+  audio against *reproducible* vision input (decouples "did approach fire" from "did the
+  robot react").
+
+**Gate:** scenarios must pass in Stage 1 before spending a live session.
+
+**Stage 2 — Live (robot + real camera).** Only what genuinely needs hardware: real
+framing, motion, audio playback over WebRTC/WiFi, network. Captured in
+[`live-test-log.md`](./live-test-log.md) (good / ugly / bad).
+
+---
+
 ## Phase A — detailed
 
 **Goal:** one resident process that owns the live hardware session and exposes
@@ -303,3 +333,6 @@ On the brain machine, robot up + same LAN, camera at the room:
 `serve --perception --brain` + `alert_engine`; `vision on`, `voice on`; walk up →
 robot greets (B); talk → it converses (C). Prereq on the brain machine:
 `uv pip install -e ".[vision]"` (rfdetr + supervision) and the `claude` CLI authed.
+
+> Live-test results, issues, and the good/ugly/bad log live in
+> [`live-test-log.md`](./live-test-log.md) — not here.

@@ -1,9 +1,9 @@
 """Alert engine — the SEPARATE "check & react" process.
 
-Tails the perception event log (events.jsonl) and, on each new `approach` event,
-applies alert policy (here: a global cooldown) and tells the reception daemon to
-react — the robot greets the visitor. Decoupled from perception on purpose:
-perception only observes & emits; this process decides what to do.
+Tails the perception event log (events.jsonl) and maps each event type to a robot
+action — `approach` -> greet, `depart` -> goodbye — applying a per-type cooldown.
+Decoupled from perception on purpose: perception only observes & emits; this
+process decides what to do.
 
 Run alongside the reception daemon:
     python -m reachy_mini_brain.alert_engine [--events PATH] [--cooldown SEC]
@@ -41,35 +41,44 @@ def _tail(path: Path, from_end: bool = True):
                 continue
 
 
-def run(events_path: Path, cooldown: float = 15.0) -> None:
+def run(events_path: Path, cooldown: float = 15.0, types: set[str] | None = None) -> None:
     import sys
     try:
         sys.stdout.reconfigure(line_buffering=True)  # flush each line (long-running process)
     except Exception:
         pass
-    print(f"alert engine: watching {events_path} (cooldown {cooldown}s)")
-    last_react = 0.0
+    # event type -> daemon command. Independent per-type cooldown so a greet and a
+    # goodbye don't suppress each other. `types` optionally restricts which fire.
+    actions = {"approach": "react", "depart": "farewell"}
+    if types:
+        actions = {k: v for k, v in actions.items() if k in types}
+    print(f"alert engine: watching {events_path} (cooldown {cooldown}s, acting on {sorted(actions)})")
+    last: dict[str, float] = {}
     for ev in _tail(Path(events_path)):
-        if ev.get("type") != "approach":
+        etype = ev.get("type")
+        cmd = actions.get(etype)
+        if cmd is None:
             continue
         now = time.time()
-        if now - last_react < cooldown:
-            print(f"  approach id={ev.get('id')} — within cooldown, skip")
+        if now - last.get(etype, 0.0) < cooldown:
+            print(f"  {etype} id={ev.get('id')} — within cooldown, skip")
             continue
-        last_react = now
-        print(f"  approach id={ev.get('id')} -> telling robot to react")
+        last[etype] = now
+        print(f"  {etype} id={ev.get('id')} -> {cmd}")
         try:
-            res = reception._client("react")
+            res = reception._client(cmd)
             print("    daemon:", res.get("result") if res.get("ok") else f"ERROR {res.get('error')}")
         except (FileNotFoundError, ConnectionRefusedError):
-            print("    react failed: reception daemon not running")
+            print(f"    {cmd} failed: reception daemon not running")
         except Exception as e:  # noqa: BLE001
-            print(f"    react failed: {e}")
+            print(f"    {cmd} failed: {e}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--events", default=str(DEFAULT_EVENTS_PATH), help="event log to tail")
     ap.add_argument("--cooldown", type=float, default=15.0, help="min seconds between reactions")
+    ap.add_argument("--types", default=None, help="comma-separated event types to act on (default: all)")
     args = ap.parse_args()
-    run(Path(args.events), args.cooldown)
+    types = set(args.types.split(",")) if args.types else None
+    run(Path(args.events), args.cooldown, types)

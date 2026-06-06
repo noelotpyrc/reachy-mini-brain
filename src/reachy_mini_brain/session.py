@@ -51,6 +51,7 @@ class Session:
         self._warmup_video = warmup_video
         self._mini = None
         self._push_lock = threading.Lock()
+        self._speaking = False  # True during speak(); mic listener + vision pause on it
 
     # --- Lifecycle ---
 
@@ -217,20 +218,32 @@ class Session:
         if audio.ndim > 1:
             audio = audio[:, 0]
 
-        # Flag so listener thread discards mic input during playback
-        if hasattr(self, "_speaking"):
-            self._speaking = True
+        # Prepend a short silence lead-in — the send chain swallows the first ~150ms
+        # when it spins up, which was clipping the first syllable ("he" of "Hello").
+        audio = np.concatenate([np.zeros(int(0.3 * 16000), dtype=np.float32), audio])
 
-        # Push in chunks, paced to real-time
-        chunk_size = 320
-        for i in range(0, len(audio), chunk_size):
-            chunk = audio[i : i + chunk_size]
-            self.push_audio_sample(chunk)
-            time.sleep(chunk_size / 16000 * 0.9)
-
-        time.sleep(0.5)  # let final chunks play out
-
-        if hasattr(self, "_speaking"):
+        # Pause the mic listener AND the vision worker for the whole playback — both
+        # contend with the audio push thread, and vision (RF-DETR) contention is what
+        # makes speech choppy. try/finally so a push error can't leave it stuck paused.
+        # (First-pass: the proper fix is to run perception in its own OS process.)
+        self._speaking = True
+        try:
+            # Feed the speaker with a primed cushion, then at real-time. Two failure
+            # modes to avoid: the old 20ms-chunk near-real-time push *underran* (choppy)
+            # under thread contention; dumping the whole utterance at once *overflowed*
+            # the pipeline's audio queue and dropped the tail. So push ~0.5s up front as
+            # a cushion, then pace the rest at ~real-time so the queue neither starves
+            # nor overflows.
+            chunk_size = 3200  # 200ms — big chunks => few push calls => robust to jitter
+            prime_samples = 16000  # ~1.0s cushion pushed up front for scheduling-jitter headroom
+            i = 0
+            while i < len(audio):
+                self.push_audio_sample(np.ascontiguousarray(audio[i : i + chunk_size]))
+                i += chunk_size
+                if i >= prime_samples:
+                    time.sleep(chunk_size / 16000.0 * 0.95)
+            time.sleep(prime_samples / 16000.0 + 0.5)  # drain the cushion still queued
+        finally:
             self._speaking = False
 
     # --- Continuous listening ---
