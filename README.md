@@ -26,8 +26,10 @@ src/reachy_mini_brain/
 ├── reception.py     # resident daemon: vision/voice/brain toggles + control socket
 ├── detector.py      # RF-DETR Nano person detection (vision tier-1)
 ├── approach.py      # ByteTrack + approach-vs-transit geometry (tiers 2-3)
-├── perception.py    # detect → track → approach → events.jsonl
-├── alert_engine.py  # separate process: tails events → robot greets
+├── perception.py    # detect → track → approach (+ gestures) → events.jsonl
+├── gesture.py       # MediaPipe wave detection (Open_Palm) — Feature 2
+├── replay.py        # offline eval harness: replay clips (--annotate, --smooth, --expect)
+├── alert_engine.py  # separate process: tails events → robot reacts (approach/depart/wave)
 └── brain.py         # claude -p receptionist agent (voice brain)
 ```
 
@@ -106,6 +108,9 @@ Camera | 4-Mic Array | Speaker | 9-DOF Motors
 
 ## Docs
 
-- `docs/robot-guide.md` — full CLI reference with all flags and options
-- `docs/plan.md` — architecture, phased roadmap, API reference
-- `docs/progress.md` — implementation log, discoveries, phase status
+- `docs/plan-reception.md` — **reception robot design-of-record** (Phases A–C, decisions,
+  testing strategy + eval framework, open items) — the living plan
+- `docs/live-test-log.md` — **on-robot test log** (good / ugly / bad, newest first)
+- `docs/robot-guide.md` — full CLI reference (per-module CLIs + the `reception` daemon)
+- `docs/plan.md`, `docs/progress.md` — earlier generic roadmap + implementation log
+  (superseded by `plan-reception.md` for the reception build; kept for history)

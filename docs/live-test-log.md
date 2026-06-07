@@ -10,6 +10,60 @@ Each entry uses three buckets:
 
 ---
 
+## 2026-06-07 — wave detection LIVE-validated; recording/persistence hardened; greet/goodbye FP confirmed on record; Phase C auth pinned
+
+**Setup:** m1max daemon (`serve --perception --gestures`), vision + stream on, alert engine.
+Several restart cycles. Recording switched to `.mkv`. Head re-leveled each restart.
+
+### 🟢 Good
+- **Wave detection (Feature 2) works end-to-end live.** MediaPipe **Gesture Recognizer**
+  (`Open_Palm`) → debounced `wave` event → alert engine (`wave → wave_back`) → robot says
+  **"Hi there!"** (deliberately distinct from the greet). Detected at score **0.61–0.73**.
+  New `gesture.py` + `perception --gestures` + `wave_back` command; mediapipe installed on
+  m1max without breaking the RF-DETR/supervision stack (numpy 2 kept).
+- **Recording persistence hardened (A/B):** `daemon.stop()` now finalizes record+capture, and
+  the daemon writes a **durable** log to `artifacts/logs/` (not `/tmp`). Verified: stop *while
+  recording* → 581-frame clip **READABLE** (pre-fix it was left corrupt).
+- **`.mkv` recording (crash-resilient):** container mp4→**mkv**, same `mp4v` codec & size. A
+  hard kill / battery-off now keeps footage up to the crash (mp4 = total loss — no `moov`).
+  Proven empirically (truncation-survival test); per-frame extraction identical to mp4.
+- **Head-stable greet/goodbye:** removed `look("center")` from `_express` — reactions no longer
+  move the head, so the camera (which rides on the head) keeps a level frame.
+- **First real eval dataset:** `video-153822.mkv` (1191 frames) + aligned `capture-153822.jsonl`
+  — **4 approach / 4 depart / 11 wave**, with the misfires below baked in.
+- **Phase C auth pinned + dev workaround works:** `claude -p` over plain SSH fails (keychain),
+  but a GUI-rooted **tmux `claude-test`** runs it authenticated (verified `OK`/exit 0).
+
+### 🟡 Ugly (acceptable / needs refining)
+- **Wave needs a minimum distance** — MediaPipe needs the hand a min size in-frame; a wave from
+  across the room won't register (scores hovered near the 0.5 floor). Characterize the working
+  range / lower the threshold later.
+- **Head roll mis-calibration (~8°)** — commanding "level" (roll 0) physically sits ~8° tilted.
+  It's a *robot calibration offset*, not our code (motors fine, head responds; commanding
+  roll ≈ **−5.7°** levels it). Matters because the camera is head-mounted (tilts every frame).
+  Proper fix = recalibrate; **deferred**. `reset` currently commands true-zero, so it re-tilts.
+- **New voice lines:** greet "Welcome to Acu Genie!", goodbye "Goodbye! Have a nice day!",
+  wave "Hi there!".
+
+### 🔴 Bad (clear issue)
+- **Greet + goodbye misfire on a stationary, *interacting* person — confirmed on record.**
+  During the wave test (same person, id=1, standing + waving):
+  - false **approach** (area grew to 0.385 as you stepped in → "Welcome to Acu Genie!"),
+  - false **depart** (area dropped to 0.284 ≈ 0.6 × peak from a **pose change / arm-raise**
+    narrowing the box → "Goodbye!") — **you never left.**
+  Same over-sensitive visit logic as the sitting-fidget FP. User: greet/goodbye were "messy —
+  misfire *and* non-fire both happened." This is the priority correctness issue.
+- The yesterday "fire-then-no-fire" bug wasn't re-diagnosed in isolation today — but we now have
+  the **eval framework + real datasets** to dissect it with data instead of guessing.
+
+### Next — the eval framework (agreed; see `plan-reception.md` → Testing strategy)
+record → annotate → **auto-label (model proposes, human verifies)** → `score` → iterate. Build
+`score` + auto-`label`; run on `video-153822.mkv`. Fix candidates (validate via the framework,
+don't ship blind): **interaction gate** (suppress greet/goodbye while waving), **depart
+robustness** (larger/sustained recession), **DetectionsSmoother**.
+
+---
+
 ## 2026-06-06 — Phase B: vision → approach → greet (m1max + real robot)
 
 **Setup:** m1max drives the daemon over SSH. `serve --perception --vision-interval 1`

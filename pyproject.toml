@@ -24,6 +24,12 @@ vision = [
     "rfdetr",
     "supervision",
 ]
+# Feature 2 — wave detection (MediaPipe gesture recognizer). Optional; only the
+# vision worker's --gestures path needs it. Pretrained model auto-downloads to
+# ~/.cache/reachy_mini/ on first use.
+gesture = [
+    "mediapipe",
+]
 sim = ["reachy-mini[mujoco]"]
 dev = ["pytest", "ruff"]
 

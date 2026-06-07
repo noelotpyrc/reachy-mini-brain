@@ -196,6 +196,34 @@ frame-source switch (camera vs file). Two sub-modes:
 framing, motion, audio playback over WebRTC/WiFi, network. Captured in
 [`live-test-log.md`](./live-test-log.md) (good / ugly / bad).
 
+### Eval framework — auto-labeled regression loop (the debug/improv flow)
+
+Hand-tuning thresholds + eyeballing live runs doesn't scale. The repeatable loop, designed
+so a **model labels and a human only verifies** (never hand-labels):
+
+1. **Record** — daemon `record` + `capture` → paired `video-*.mkv` (crash-resilient) +
+   `capture-*.jsonl` + `events.jsonl` + durable log. The video is ground truth: replay
+   reproduces the live run deterministically (same frames in → same events out).
+2. **Annotate** — `replay --annotate` burns frame numbers + boxes + dom_area + visit-state +
+   event flashes onto the clip — the review aid for verifying labels.
+3. **Auto-label** — a model proposes ground-truth segments by frame range
+   (`approach / leave / present / pass-by / empty / wave`) → `<clip>.labels.json`; a human
+   only **verifies** (review-speed). Each segment carries `expect` (must fire) / `forbid`
+   (must not) so the score catches both non-fires and misfires.
+   - **Labeler:** Claude vision (API) for our *own* dev clips — strongest, zero install.
+     A **local VLM** (Qwen2.5-VL / Moondream) is the privacy-safe swap-in **required** for
+     any patient/production footage (raw video stays local — see Privacy posture).
+4. **Score** — `reception-score <clip> <labels>` replays the clip (frame-indexed events),
+   compares fired vs labels per segment → MISFIRE / NON-FIRE / correct, with frame refs +
+   precision/recall per event type.
+5. **Iterate** — every labeled clip becomes a regression test; a logic change (depart
+   robustness, `DetectionsSmoother`, wave threshold) must cut misfire/non-fire rates without
+   breaking what passed.
+
+Status: framework agreed; `score` + the auto-`label` tool still to build (annotate + replay
+exist). First clip: `video-153822.mkv` (4 approach / 4 depart / 11 wave, with known
+greet/goodbye misfires).
+
 ---
 
 ## Phase A — detailed
@@ -288,14 +316,18 @@ unblocked.
     before any live change. These are also the cheap deterministic *baseline that a future
     learned classifier (VLM-auto-labeled event data — discussed, not yet written up) would
     have to beat* — try cheap first.
-- **Wave → conversation (Feature 2)** — gesture as the auto-trigger into voice mode
-  (replacing the human toggle). **Drop-in reference exists upstream:** pollen's
-  Greetings app `palm_tracker.py` uses MediaPipe's **Gesture Recognizer** task
-  (pre-trained `gesture_recognizer.task`, *not* raw Hand landmarks) — stateless
-  per-frame `recognize()` returning a category (`Open_Palm`, `Thumb_Up`, …) + score;
-  fire on `Open_Palm` with score ≥ 0.5. So no landmark/wave-motion math to write —
-  add `mediapipe` + the `.task` model, run it on the same frames as perception, and
-  treat an `Open_Palm` hit as the conversation-start event. Needs Phase C live first.
+- **Wave → conversation (Feature 2)** — **detection half DONE + live-validated (2026-06-07).**
+  `gesture.py` wraps MediaPipe's **Gesture Recognizer** (`Open_Palm`, score ≥ 0.5, pretrained
+  `gesture_recognizer.task`); `perception --gestures` emits a debounced `wave` event; alert
+  engine maps `wave → wave_back` ("Hi there!", a placeholder distinct from the greet). Works
+  end-to-end on the robot (scores 0.61–0.73). **Open:** (a) needs a minimum hand distance;
+  (b) the real trigger — `wave → start conversation` — still waits on Phase C; (c) waving
+  collides with the approach/depart FP (greet+goodbye misfire while you stand there) → wants
+  the interaction gate from "Approach/depart robustness" above.
+- **Head roll calibration (~8°)** — commanding roll 0 ("level") physically sits ~8° tilted; a
+  robot calibration offset (motors fine, head responds). Camera is head-mounted, so it tilts
+  every frame. Workaround: command roll ≈ −5.7°. Proper fix = recalibrate via official tooling;
+  deferred. Note: `reset` commands true-zero, so it currently *re-tilts*.
 - **Remote control** — Tailscale-exposed control endpoint for staff. Phase E.
 
 ---
@@ -360,6 +392,21 @@ Tiered, fully local. On-robot live test pending.
 - Wired into the voice worker via `serve --brain`: `listen → brain.respond() → speak`.
   Mock full-loop validated. ~2-4s, ~$0.01 per turn (Haiku, cached).
 - **TTS** = Piper, default voice `en_US-lessac-medium`. **STT** = faster-whisper.
+
+### Phase C auth — claude-on-m1max (the real blocker, now pinned down)
+
+`claude -p`'s OAuth token (from `/login`) lives in the **macOS login Keychain**, readable
+only by the **GUI session** — a headless/SSH/`nohup` process gets *"Not logged in"* (confirmed:
+a login shell doesn't fix it; `~/.claude.json` is config-only). Since the daemon is launched
+headless, `brain.py → claude -p` fails in deployment, not just in testing.
+- **Dev workaround (works now):** a GUI-rooted **tmux session `claude-test`** keeps keychain
+  access; `tmux send-keys` into it runs `claude -p` authenticated even over SSH (verified
+  `OK`/exit 0). To run the *daemon's* brain this way, start `serve` from inside that session
+  so its `claude -p` subprocess inherits the context.
+- **Caveat:** the tmux session dies on m1max reboot / GUI logout → fragile for 24/7.
+- **Production options (decide before deploy):** `ANTHROPIC_API_KEY` (headless-robust, API
+  billing) or **OpenRouter** (OpenAI-compatible; would replace the `claude -p` shell-out with
+  an API call in `brain.py`). Both bypass the keychain entirely.
 
 ## Combined live test (pending — needs the robot)
 

@@ -49,7 +49,7 @@ def run(events_path: Path, cooldown: float = 15.0, types: set[str] | None = None
         pass
     # event type -> daemon command. Independent per-type cooldown so a greet and a
     # goodbye don't suppress each other. `types` optionally restricts which fire.
-    actions = {"approach": "react", "depart": "farewell"}
+    actions = {"approach": "react", "depart": "farewell", "wave": "wave_back"}
     if types:
         actions = {k: v for k, v in actions.items() if k in types}
     print(f"alert engine: watching {events_path} (cooldown {cooldown}s, acting on {sorted(actions)})")

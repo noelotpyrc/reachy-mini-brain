@@ -16,12 +16,19 @@ DEFAULT_EVENTS_PATH = Path(__file__).resolve().parent.parent.parent / "artifacts
 
 
 class PerceptionPipeline:
-    def __init__(self, events_path=DEFAULT_EVENTS_PATH, threshold: float = 0.5, smooth: int = 0):
+    def __init__(self, events_path=DEFAULT_EVENTS_PATH, threshold: float = 0.5, smooth: int = 0,
+                 gestures: bool = False, gesture_cooldown: float = 3.0):
         from reachy_mini_brain.detector import PersonDetector
 
         self._detector = PersonDetector(threshold=threshold)
         self._smooth = smooth
         self._approach = None  # built lazily once we know the frame size
+        # Feature 2 — wave detection (MediaPipe gesture recognizer), independent of
+        # person detection. Lazy-loaded on first use; debounced so a held palm = 1 event.
+        self._gestures = gestures
+        self._gesture_cooldown = gesture_cooldown
+        self._gesture_detector = None
+        self._last_wave = 0.0
         self._events_path = Path(events_path)
         self._events_path.parent.mkdir(parents=True, exist_ok=True)
         # Pre-create the log so an alert engine that starts first (and seeks to end)
@@ -40,9 +47,29 @@ class PerceptionPipeline:
 
         persons = self._detector.detect(frame, bgr=bgr)
         events = self._approach.update(persons)
+        if self._gestures:
+            wave = self._detect_wave(frame)
+            if wave:
+                events = events + [wave]
         for ev in events:
             rec = {"type": ev["kind"], "ts": round(time.time(), 3),
                    **{k: v for k, v in ev.items() if k != "kind"}}
             with self._events_path.open("a") as f:
                 f.write(json.dumps(rec) + "\n")
         return events, len(persons), self._approach.frame_debug
+
+    def _detect_wave(self, frame) -> dict | None:
+        """Open-palm 'wave' event (debounced). frame is BGR (the gesture detector
+        converts internally)."""
+        if self._gesture_detector is None:
+            from reachy_mini_brain.gesture import GestureDetector
+            self._gesture_detector = GestureDetector()
+        hit = self._gesture_detector.detect(frame)
+        if not hit:
+            return None
+        now = time.time()
+        if now - self._last_wave < self._gesture_cooldown:
+            return None
+        self._last_wave = now
+        name, score = hit
+        return {"kind": "wave", "gesture": name, "score": round(score, 2)}

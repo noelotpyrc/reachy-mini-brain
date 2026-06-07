@@ -137,3 +137,62 @@ Full reference for all CLI commands. All commands run from project root.
 ```
 
 Prints JSON with head pose matrix, antenna angles, and IMU data (if wireless).
+
+## Reception daemon
+
+The resident reception robot (see `docs/plan-reception.md`). One long-lived `serve` process
+owns the single robot session; all other `reception` commands are thin clients that talk to it
+over a Unix socket (`/tmp/reachy_mini_reception.sock`) — run them from any other shell. Prefix
+everything with `.venv/bin/python -m reachy_mini_brain.reception` (or the `reception`
+console-script after `pip install -e .`).
+
+```bash
+# Start the daemon (blocks). Workers boot OFF; toggle them from another shell.
+reception serve --perception --gestures            # vision pipeline + wave detection
+reception serve --perception --brain               # vision + claude -p voice brain (needs auth)
+
+# Worker toggles + reactions (from another shell)
+reception status                                   # vision/voice + session health (connected/audio/video)
+reception vision on | off                          # RF-DETR person/approach pipeline
+reception voice  on | off                          # mic → STT → (brain) → speak
+reception react                                    # greeting   ("Welcome to Acu Genie!")
+reception farewell                                 # goodbye    ("Goodbye! Have a nice day!")
+reception wave                                     # wave ack   ("Hi there!" — distinct from greet)
+reception reset                                    # head + body + antennas → neutral (no speech)
+
+# Data capture (vision must be ON)
+reception record  on | off                         # camera → artifacts/video-<ts>.mkv  (crash-resilient)
+reception capture on | off                         # per-frame tracks/events → artifacts/capture-<ts>.jsonl
+reception stream  on | off                         # live MJPEG on 127.0.0.1:8090 (view via ssh -L 8090:localhost:8090)
+
+reception shutdown                                 # graceful stop — finalizes record/capture, removes socket
+
+# Alert engine — SEPARATE process: tails artifacts/events.jsonl → fires robot reactions
+python -m reachy_mini_brain.alert_engine --cooldown 5   # approach→react, depart→farewell, wave→wave_back
+#  ([--types approach,depart,wave] restricts which event types fire)
+```
+
+### `serve` flags
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--perception / --no-perception` | off | Run RF-DETR person/approach pipeline in the vision worker |
+| `--gestures / --no-gestures` | off | Also run MediaPipe wave detection (`Open_Palm`) — needs `mediapipe` |
+| `--brain / --no-brain` | off | Route heard speech to the `claude -p` receptionist brain |
+| `--brain-model` | `sonnet` | Brain model (`haiku` in practice) |
+| `--vision-interval` | `2.0` | Seconds between frame grabs (post-processing wait; ~3 fps at 0.2) |
+| `--voice-interval` | `3.0` | Seconds between mic reads |
+| `--threshold` | `0.5` | Detector confidence threshold |
+| `--mock` | — | Fake session (no SDK/robot) for plumbing tests |
+
+### Notes
+
+- **Durable log:** the daemon writes `artifacts/logs/reception-<ts>.log` (timestamped, survives
+  restarts). Launch it detached with `nohup caffeinate -dimsu … &` on m1max so it doesn't sleep.
+- **Recording is `.mkv`** (`mp4v` codec): a hard kill/battery-off keeps footage up to the crash
+  (an `.mp4` would be unreadable without its trailing index). Graceful `shutdown`/`record off`
+  finalizes cleanly either way.
+- **One session only:** the daemon and the official Control app can't both hold the robot — stop
+  one before the other.
+- Offline replay/eval of recorded clips: `python -m reachy_mini_brain.replay <clip> [--trace]
+  [--smooth N] [--annotate out.mkv] [--expect-approach N --expect-depart N]`.

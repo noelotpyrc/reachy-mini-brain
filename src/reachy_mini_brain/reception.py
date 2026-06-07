@@ -129,17 +129,20 @@ class ReceptionDaemon:
 
     def __init__(self, session, vision_interval: float = 2.0,
                  voice_interval: float = 3.0, perception: bool = False,
-                 threshold: float = 0.5,
+                 threshold: float = 0.5, gestures: bool = False,
                  greeting: str = "Welcome to Acu Genie!",
                  farewell: str = "Goodbye! Have a nice day!",
+                 wave_message: str = "Hi there!",
                  brain: bool = False, brain_model: str = "sonnet"):
         self._session = session
         self._vision_interval = vision_interval
         self._voice_interval = voice_interval
         self._perception_enabled = perception
         self._threshold = threshold
+        self._gestures = gestures
         self._greeting = greeting
         self._farewell = farewell
+        self._wave_message = wave_message
         self._brain_enabled = brain
         self._brain_model = brain_model
         self._lock = threading.Lock()
@@ -245,7 +248,7 @@ class ReceptionDaemon:
             from reachy_mini_brain.perception import PerceptionPipeline
 
             log.info("vision: loading perception (RF-DETR)...")
-            p = PerceptionPipeline(threshold=self._threshold)
+            p = PerceptionPipeline(threshold=self._threshold, gestures=self._gestures)
             log.info("vision: perception ready")
             return p
         except Exception as e:  # noqa: BLE001
@@ -482,6 +485,11 @@ class ReceptionDaemon:
         """Say goodbye to a departing visitor."""
         return self._express(self._farewell, "farewell: said goodbye", "farewelled")
 
+    def wave_back(self) -> str:
+        """Acknowledge a wave — a DISTINCT response from the approach greeting so the
+        two are easy to tell apart when testing wave detection."""
+        return self._express(self._wave_message, "wave_back: acknowledged a wave", "waved back")
+
     def _express(self, message: str, done_log: str, result: str) -> str:
         """Flick antennas, speak, reset antennas. Deliberately does NOT move the head:
         the camera rides on the head, so any glance would tilt/shift every video frame.
@@ -509,7 +517,7 @@ def _alive(t: threading.Thread | None) -> bool:
 
 # daemon methods callable over the socket
 _COMMANDS = {"vision_on", "vision_off", "voice_on", "voice_off", "status", "react",
-             "farewell", "reset", "capture_on", "capture_off", "record_on", "record_off",
+             "farewell", "reset", "wave_back", "capture_on", "capture_off", "record_on", "record_off",
              "stream_on", "stream_off"}
 
 
@@ -553,6 +561,7 @@ def _handle(daemon: ReceptionDaemon, conn: socket.socket) -> bool:
 
 def serve_daemon(mock: bool, vision_interval: float, voice_interval: float,
                  perception: bool = False, threshold: float = 0.5,
+                 gestures: bool = False,
                  brain: bool = False, brain_model: str = "sonnet"):
     """Start the reception daemon + control socket (blocks until shutdown)."""
     if mock:
@@ -565,7 +574,7 @@ def serve_daemon(mock: bool, vision_interval: float, voice_interval: float,
 
     daemon = ReceptionDaemon(
         session, vision_interval=vision_interval, voice_interval=voice_interval,
-        perception=perception, threshold=threshold,
+        perception=perception, threshold=threshold, gestures=gestures,
         brain=brain, brain_model=brain_model,
     )
 
@@ -665,10 +674,12 @@ def cli():
 @click.option("--perception/--no-perception", default=False,
               help="Run the RF-DETR person/approach pipeline in the vision worker.")
 @click.option("--threshold", default=0.5, help="Detector confidence threshold.")
+@click.option("--gestures/--no-gestures", default=False,
+              help="Also run MediaPipe wave detection (Open_Palm) in the vision worker.")
 @click.option("--brain/--no-brain", default=False,
               help="Route heard speech to the claude -p receptionist brain and speak the reply.")
 @click.option("--brain-model", default="sonnet", help="Brain model (e.g. sonnet, haiku, opus).")
-def serve(mock, vision_interval, voice_interval, perception, threshold, brain, brain_model):
+def serve(mock, vision_interval, voice_interval, perception, threshold, gestures, brain, brain_model):
     """Run the reception daemon (blocks until `shutdown` or Ctrl-C)."""
     # Durable log: the daemon owns a timestamped file under artifacts/logs/ (never /tmp,
     # which the OS cleans), in addition to stderr. Survives restarts; never overwritten.
@@ -682,7 +693,7 @@ def serve(mock, vision_interval, voice_interval, perception, threshold, brain, b
     )
     log.info("durable log -> %s", logfile)
     serve_daemon(mock, vision_interval, voice_interval, perception, threshold,
-                 brain, brain_model)
+                 gestures, brain, brain_model)
 
 
 @cli.command()
@@ -715,6 +726,12 @@ def reset():
 def farewell():
     """Trigger the robot's goodbye (normally the alert engine fires this on departure)."""
     _run_client("farewell")
+
+
+@cli.command()
+def wave():
+    """Trigger the wave acknowledgment — distinct from the greeting (alert engine fires this on a wave)."""
+    _run_client("wave_back")
 
 
 @cli.command()
