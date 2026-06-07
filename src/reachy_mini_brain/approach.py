@@ -18,13 +18,20 @@ Box area is a fraction of the frame (0..1) — a noisy, person-size-dependent pr
 closeness — so triggers are RELATIVE to the visitor's own trajectory (entry/peak)
 wherever possible. Depart needs no absolute size (it references the peak); greet needs
 one small floor because there's no stable reference at the very start of a visit.
+
+NOTE: instrumented for the open "fired then no-fire" bug — see the visit-state logging
+in `_update_visit`. Do not "fix" the logic until that's reproduced + the trace confirms
+the cause.
 """
 
 from __future__ import annotations
 
+import logging
 import warnings
 
 import supervision as sv
+
+log = logging.getLogger("approach")
 
 
 class ApproachTracker:
@@ -38,6 +45,7 @@ class ApproachTracker:
         present_frac: float = 0.03,
         reset_absent: int = 40,
         history: int = 30,
+        smooth: int = 0,
     ):
         self.W, self.H = frame_wh
         self.growth_factor = growth_factor  # greet Gate 2: area grown >= this x the visit's entry size
@@ -48,10 +56,15 @@ class ApproachTracker:
         self.reset_absent = reset_absent    # frames absent before the visit resets (survives the close blind spot)
         self.history = history
         self.frame_debug: list[dict] = []
+        self._fc = 0  # frame counter for throttled diagnostic logging
         # sv.ByteTrack is deprecated in supervision 0.28 (removed in 0.30) but works fine.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._tracker = sv.ByteTrack()
+        # Optional temporal smoothing of the box envelope (per tracker_id) to damp the
+        # area jitter that trips greet on small movements / edge flicker. 0 = off (default,
+        # so live behavior is unchanged until we validate a window offline).
+        self._smoother = sv.DetectionsSmoother(length=smooth) if smooth > 0 else None
         self._reset_visit()
 
     def _reset_visit(self) -> None:
@@ -61,11 +74,21 @@ class ApproachTracker:
         self._depart_fired = False
         self._absent = 0
         self._dom_hist: list[float] = []
+        self._last_dom_area = 0.0  # most recent dominant area (for the debug overlay)
+
+    @property
+    def debug_state(self) -> dict:
+        """Snapshot of the visit state machine — drives the annotated-replay overlay."""
+        return {"dom_area": self._last_dom_area, "absent": self._absent,
+                "peak": self._visit_peak, "greet": self._greet_fired,
+                "depart": self._depart_fired}
 
     def update(self, persons: sv.Detections) -> list[dict]:
         """One frame of person detections -> NEW events
         `{kind: "approach"|"depart", id, area, cx, cy}` (once per visit per kind)."""
         tracked = self._tracker.update_with_detections(persons)
+        if self._smoother is not None:
+            tracked = self._smoother.update_with_detections(tracked)
         frame_area = float(self.W * self.H)
         frame_debug: list[dict] = []
         dom_area, dom = 0.0, None
@@ -80,12 +103,15 @@ class ApproachTracker:
             if area > dom_area:                       # the dominant (closest) person this frame
                 dom_area, dom = area, (tid, area, cx, cy)
             frame_debug.append({"id": int(tid), "area": float(round(area, 3)),
-                                "cx": float(round(cx, 2)), "cy": float(round(cy, 2))})
+                                "cx": float(round(cx, 2)), "cy": float(round(cy, 2)),
+                                "box": [int(x1), int(y1), int(x2), int(y2)]})
         self.frame_debug = frame_debug
         return self._update_visit(dom_area, dom)
 
     def _update_visit(self, dom_area: float, dom) -> list[dict]:
         events: list[dict] = []
+        self._fc += 1
+        self._last_dom_area = dom_area
         if dom_area >= self.present_frac:             # a visitor is present
             self._absent = 0
             self._dom_hist.append(dom_area)
@@ -112,7 +138,14 @@ class ApproachTracker:
         else:                                         # no visitor in view
             self._absent += 1
             if self._absent >= self.reset_absent:     # visitor truly gone -> next is a new visit
+                log.info("visit RESET (absent %d frames) — greet/goodbye re-armed", self._absent)
                 self._reset_visit()
+        # throttled visit-state trace — to diagnose the 'fired then no-fire' lockup: if
+        # greet/depart stay True while absent never climbs, the visit never reset (something
+        # is keeping a detection alive >= present_frac).
+        if self._fc % 25 == 0:
+            log.info("visit: dom=%.3f absent=%d peak=%.3f greet=%s depart=%s",
+                     dom_area, self._absent, self._visit_peak, self._greet_fired, self._depart_fired)
         return events
 
     @staticmethod

@@ -16,10 +16,11 @@ DEFAULT_EVENTS_PATH = Path(__file__).resolve().parent.parent.parent / "artifacts
 
 
 class PerceptionPipeline:
-    def __init__(self, events_path=DEFAULT_EVENTS_PATH, threshold: float = 0.5):
+    def __init__(self, events_path=DEFAULT_EVENTS_PATH, threshold: float = 0.5, smooth: int = 0):
         from reachy_mini_brain.detector import PersonDetector
 
         self._detector = PersonDetector(threshold=threshold)
+        self._smooth = smooth
         self._approach = None  # built lazily once we know the frame size
         self._events_path = Path(events_path)
         self._events_path.parent.mkdir(parents=True, exist_ok=True)
@@ -35,7 +36,7 @@ class PerceptionPipeline:
 
         if self._approach is None:
             h, w = frame.shape[:2]
-            self._approach = ApproachTracker((w, h))
+            self._approach = ApproachTracker((w, h), smooth=self._smooth)
 
         persons = self._detector.detect(frame, bgr=bgr)
         events = self._approach.update(persons)

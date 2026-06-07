@@ -108,6 +108,12 @@ class MockSession:
     def antennas(self, left, right):
         log.info("mock session: antennas (%s, %s)", left, right)
 
+    def move_head(self, pitch=0.0, roll=0.0, yaw=0.0, duration=1.0):
+        log.info("mock session: move_head pitch=%s roll=%s yaw=%s", pitch, roll, yaw)
+
+    def rotate_body(self, angle, duration=1.0):
+        log.info("mock session: rotate_body %s", angle)
+
 
 # ---------------------------------------------------------------------------
 # Reception daemon — the state machine
@@ -124,8 +130,8 @@ class ReceptionDaemon:
     def __init__(self, session, vision_interval: float = 2.0,
                  voice_interval: float = 3.0, perception: bool = False,
                  threshold: float = 0.5,
-                 greeting: str = "Hello! Welcome. Someone will be with you shortly.",
-                 farewell: str = "Goodbye, have a nice day!",
+                 greeting: str = "Welcome to Acu Genie!",
+                 farewell: str = "Goodbye! Have a nice day!",
                  brain: bool = False, brain_model: str = "sonnet"):
         self._session = session
         self._vision_interval = vision_interval
@@ -167,9 +173,13 @@ class ReceptionDaemon:
 
     def stop(self):
         """Stop both workers, then the session. Workers first so they never
-        call into a torn-down session."""
+        call into a torn-down session. Finalize record/capture AFTER the vision
+        thread is joined (so no frame is mid-write) — a graceful shutdown must
+        release the VideoWriter, or the mp4 is left unfinalized and unreadable."""
         self.vision_off()
         self.voice_off()
+        self.record_off()
+        self.capture_off()
         self._session.stop()
 
     # --- vision toggle ---
@@ -282,12 +292,14 @@ class ReceptionDaemon:
     # --- record toggle (persist the camera frames to an mp4) ---
 
     def record_on(self) -> str:
-        """Record the frames the vision worker grabs to an mp4 (needs vision on).
-        Frame rate follows --vision-interval; lower it for smoother clips."""
+        """Record the frames the vision worker grabs to an mkv (needs vision on).
+        Matroska (not mp4) so a hard kill / battery-off keeps the footage up to the
+        crash — mp4 needs a trailing moov index written at release() and is otherwise
+        unreadable. Same mp4v codec, same size. Frame rate follows --vision-interval."""
         with self._lock:
             if self._recording:  # don't clobber an in-progress recording's writer
                 return f"already recording -> {self._record_path} ({self._record_frames} frames so far)"
-            self._record_path = ARTIFACTS / f"video-{time.strftime('%H%M%S')}.mp4"
+            self._record_path = ARTIFACTS / f"video-{time.strftime('%H%M%S')}.mkv"
             self._record_path.parent.mkdir(parents=True, exist_ok=True)
             self._record_writer = None  # lazy-created on first frame (needs w/h)
             self._record_frames = 0
@@ -458,14 +470,23 @@ class ReceptionDaemon:
         """Greet an approaching visitor."""
         return self._express(self._greeting, "react: greeted visitor", "reacted")
 
+    def reset(self) -> str:
+        """Reset head + body + antennas to a neutral 'home' pose (no speech/gesture)."""
+        self._session.move_head(pitch=0.0, roll=0.0, yaw=0.0, duration=0.8)
+        self._session.rotate_body(0.0, duration=0.8)
+        self._session.antennas(0.0, 0.0)
+        log.info("reset: head/body/antennas to neutral")
+        return "reset: head + body + antennas neutral"
+
     def farewell(self) -> str:
         """Say goodbye to a departing visitor."""
         return self._express(self._farewell, "farewell: said goodbye", "farewelled")
 
     def _express(self, message: str, done_log: str, result: str) -> str:
-        """Glance to center, flick antennas, speak, reset antennas."""
+        """Flick antennas, speak, reset antennas. Deliberately does NOT move the head:
+        the camera rides on the head, so any glance would tilt/shift every video frame.
+        Antennas are separate joints (not in the camera view) so they're safe to keep."""
         for action in (
-            lambda: self._session.look("center"),
             lambda: self._session.antennas(20, 20),
             lambda: self._session.speak(message),
             lambda: self._session.antennas(0, 0),
@@ -488,7 +509,7 @@ def _alive(t: threading.Thread | None) -> bool:
 
 # daemon methods callable over the socket
 _COMMANDS = {"vision_on", "vision_off", "voice_on", "voice_off", "status", "react",
-             "farewell", "capture_on", "capture_off", "record_on", "record_off",
+             "farewell", "reset", "capture_on", "capture_off", "record_on", "record_off",
              "stream_on", "stream_off"}
 
 
@@ -649,12 +670,17 @@ def cli():
 @click.option("--brain-model", default="sonnet", help="Brain model (e.g. sonnet, haiku, opus).")
 def serve(mock, vision_interval, voice_interval, perception, threshold, brain, brain_model):
     """Run the reception daemon (blocks until `shutdown` or Ctrl-C)."""
+    # Durable log: the daemon owns a timestamped file under artifacts/logs/ (never /tmp,
+    # which the OS cleans), in addition to stderr. Survives restarts; never overwritten.
+    logfile = ARTIFACTS / "logs" / f"reception-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    logfile.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(threadName)-7s %(message)s",
         datefmt="%H:%M:%S",
-        stream=sys.stderr,
+        handlers=[logging.StreamHandler(sys.stderr), logging.FileHandler(logfile)],
     )
+    log.info("durable log -> %s", logfile)
     serve_daemon(mock, vision_interval, voice_interval, perception, threshold,
                  brain, brain_model)
 
@@ -680,6 +706,12 @@ def react():
 
 
 @cli.command()
+def reset():
+    """Reset the robot pose: head + body + antennas to neutral (no speech)."""
+    _run_client("reset")
+
+
+@cli.command()
 def farewell():
     """Trigger the robot's goodbye (normally the alert engine fires this on departure)."""
     _run_client("farewell")
@@ -695,7 +727,7 @@ def capture(state):
 @cli.command()
 @click.argument("state", type=click.Choice(["on", "off"]))
 def record(state):
-    """Record the camera to artifacts/video-*.mp4 (needs vision on)."""
+    """Record the camera to artifacts/video-*.mkv (needs vision on)."""
     _run_client(f"record_{state}")
 
 

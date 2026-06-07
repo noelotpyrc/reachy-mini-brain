@@ -19,6 +19,28 @@ from pathlib import Path
 import click
 
 
+def _annotate_frame(frame, idx, dbg, state, events):
+    """Render detection boxes + the visit state machine + event flashes onto a frame
+    copy — this is the 'combine log + video' view (state is deterministic from the clip)."""
+    import cv2
+
+    img = frame.copy()
+    for d in dbg:
+        x1, y1, x2, y2 = d.get("box", (0, 0, 0, 0))
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 0), 2)
+        cv2.putText(img, f"id{d['id']} a={d['area']:.2f}", (x1, max(12, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1, cv2.LINE_AA)
+    hud = (f"f{idx}  dom={state['dom_area']:.3f}  absent={state['absent']}  "
+           f"peak={state['peak']:.3f}  greet={state['greet']}  depart={state['depart']}")
+    cv2.putText(img, hud, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, hud, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    for j, ev in enumerate(events):
+        color = (0, 165, 255) if ev["kind"] == "approach" else (255, 80, 80)
+        cv2.putText(img, ev["kind"].upper(), (8, 74 + j * 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 4, cv2.LINE_AA)
+    return img
+
+
 @click.command()
 @click.argument("video", type=click.Path(exists=True))
 @click.option("--threshold", default=0.5, help="Detector confidence threshold.")
@@ -26,9 +48,12 @@ import click
 @click.option("--trace/--no-trace", default=False, help="Print per-frame per-track stats.")
 @click.option("--reverse", is_flag=True, help="Process frames in reverse — turns an approach clip into a depart test.")
 @click.option("--from-frame", type=int, default=0, help="Skip frames before this index (e.g. feed ONLY the walk-away, no walk-up).")
+@click.option("--smooth", type=int, default=0, help="DetectionsSmoother window (0=off) — A/B the box-area jitter smoothing.")
+@click.option("--annotate", type=click.Path(), default=None,
+              help="Write a debug mp4: detection boxes + visit-state overlay + event flashes (combine log+video).")
 @click.option("--expect-approach", type=int, default=None, help="Assert this many approach events.")
 @click.option("--expect-depart", type=int, default=None, help="Assert this many depart events.")
-def main(video, threshold, every, trace, reverse, from_frame, expect_approach, expect_depart):
+def main(video, threshold, every, trace, reverse, from_frame, smooth, annotate, expect_approach, expect_depart):
     """Replay VIDEO through the perception pipeline and report/assert events."""
     import cv2
 
@@ -36,9 +61,10 @@ def main(video, threshold, every, trace, reverse, from_frame, expect_approach, e
 
     # isolated events log so we never touch the daemon's real artifacts/events.jsonl
     tmp = Path(tempfile.gettempdir()) / "reachy_replay_events.jsonl"
-    pipe = PerceptionPipeline(events_path=tmp, threshold=threshold)
+    pipe = PerceptionPipeline(events_path=tmp, threshold=threshold, smooth=smooth)
 
     cap = cv2.VideoCapture(video)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     frames = []
     while True:
         ok, frame = cap.read()
@@ -50,6 +76,12 @@ def main(video, threshold, every, trace, reverse, from_frame, expect_approach, e
         frames.reverse()
     if from_frame:
         frames = frames[from_frame:]
+
+    writer = None
+    if annotate and frames:
+        h0, w0 = frames[0].shape[:2]
+        out_fps = max(1.0, (src_fps or 5.0) / max(1, every))
+        writer = cv2.VideoWriter(annotate, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (w0, h0))
 
     counts = {"approach": 0, "depart": 0}
     processed = 0
@@ -64,8 +96,14 @@ def main(video, threshold, every, trace, reverse, from_frame, expect_approach, e
         if trace:
             for d in dbg:
                 click.echo(f"    f{i:4d} id={d['id']} area={d['area']:.3f}")
+        if writer is not None:
+            writer.write(_annotate_frame(frame, i, dbg, pipe._approach.debug_state, events))
 
-    click.echo(f"=> {processed} frames processed | approach={counts['approach']} depart={counts['depart']}")
+    if writer is not None:
+        writer.release()
+        click.echo(f"   annotated debug video -> {annotate}")
+
+    click.echo(f"=> {processed} frames processed | smooth={smooth} | approach={counts['approach']} depart={counts['depart']}")
 
     expects = [("approach", expect_approach), ("depart", expect_depart)]
     asserted = [e for e in expects if e[1] is not None]

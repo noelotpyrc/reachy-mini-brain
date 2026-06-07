@@ -262,6 +262,40 @@ unblocked.
 - **FAQ knowledge** — currently facts-in-persona (Haiku drifts); add an authoritative
   FAQ tool. Phase C polish.
 - **STT reliability** — still faster-whisper; the "Reachy" mishear issue stands.
+- **Approach/depart robustness — candidate fixes (NOT committed; validate offline first).**
+  Aimed at the live false-greets: sitting still, small body movements, and edge-of-frame
+  in/out flicker all tripping greet. Three options, cheapest first:
+  - **`DetectionsSmoother(length=N)`** (supervision 0.28, already a dep — same lib as our
+    `ByteTrack`, zero new deps) — averages box xyxy + confidence over the last N frames per
+    `tracker_id`; smooths the area signal that's crossing our greet threshold. Additive,
+    low-risk (~3 lines in `approach.py`); cost is a small lag (~N/fps). *Cheapest / lowest-risk.*
+  - **`PolygonZone`** (supervision 0.28) — reframe greet/depart as a tracked person entering/
+    leaving a "near-desk" zone (stateless + debounce, no bespoke latch; excludes edge
+    detections by construction). **Caveat that probably kills it:** the polygon is in *fixed
+    pixel space*, but our camera is **head-mounted** — any head turn/track/reaction shifts the
+    desk in the frame, so the zone stops meaning "the desk." Only viable with head-pose gating
+    or a pose→pixel transform. Skeptical; parked.
+  - **Monocular depth — `Depth Anything V2` Small** (open-source, in Apple's CoreML library;
+    ~25–40 ms on Apple Silicon / our M1 Max, ~50 MB F16). Per-frame person *depth* → a
+    shrinking depth = approaching, replacing the box-area-as-distance hack with a learned
+    signal. **Best fit for the moving camera:** per-frame depth doesn't care that the head
+    moved *within* a frame (the weakness that sank PolygonZone), and easily fits the 5 fps
+    budget (200 ms/frame). Heavier than the supervision tools (a model + inference) but the
+    most *principled* fix — the open-source echo of how Tesla FSD replaced hand-geometry with
+    learned camera 3D (+ a big-model-labels-small-model data engine). *Most promising if
+    box-area stays flaky.*
+  - Either way: prove it on the recorded walk-up/walk-away clips via the **replay harness**
+    before any live change. These are also the cheap deterministic *baseline that a future
+    learned classifier (VLM-auto-labeled event data — discussed, not yet written up) would
+    have to beat* — try cheap first.
+- **Wave → conversation (Feature 2)** — gesture as the auto-trigger into voice mode
+  (replacing the human toggle). **Drop-in reference exists upstream:** pollen's
+  Greetings app `palm_tracker.py` uses MediaPipe's **Gesture Recognizer** task
+  (pre-trained `gesture_recognizer.task`, *not* raw Hand landmarks) — stateless
+  per-frame `recognize()` returning a category (`Open_Palm`, `Thumb_Up`, …) + score;
+  fire on `Open_Palm` with score ≥ 0.5. So no landmark/wave-motion math to write —
+  add `mediapipe` + the `.task` model, run it on the same frames as perception, and
+  treat an `Open_Palm` hit as the conversation-start event. Needs Phase C live first.
 - **Remote control** — Tailscale-exposed control endpoint for staff. Phase E.
 
 ---

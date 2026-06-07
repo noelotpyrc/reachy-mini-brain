@@ -167,3 +167,73 @@ dominant visitor's area envelope:
   Tuning ideas: **speak first / move concurrently**, faster alert poll, and
   **pre-synthesize** the fixed greeting/goodbye lines. Deferred.
 - `greet_floor` (0.10) sets greet timing — one knob, lower = greet sooner/farther.
+
+---
+
+## 2026-06-06 (evening) — OPEN BUG: greet/goodbye "fire then no-fire"
+
+**Symptom (corrected by the user):** greet + goodbye fire correctly for a stretch, then
+**stop firing entirely** within the same session ("fired, then no fire"). Recurs. Last
+real triggers were 15:20:01 in `events.jsonl`, then nothing for >1h. The **live stream
+stayed up the whole time — video was NOT dead.**
+
+### 🔴 Bad — the bug (unresolved; collect data tomorrow)
+- `events.jsonl` *stops getting new events* → the **tracker stops emitting**, not the
+  alert engine. In `approach.py`, greet/goodbye each fire **once per "visit,"** and a visit
+  only re-arms after the person is **absent ≥ `reset_absent` (40 frames / 8s)**.
+- **Theory (to confirm, NOT asserted):** if anything keeps a detection alive ≥
+  `present_frac` (0.03) — a lingering person, a false-positive, or the head pointed at a
+  mis-detected object — the visit **never resets**, both latches stay stuck, nothing fires
+  again.
+
+### 🟡 My process failures this session (do not repeat)
+- **Misread `video_ready:false` as "video dead."** It's a single `try_pull_sample(20ms)`
+  that *consumes* a frame from the GStreamer appsink → returns None routinely (between
+  frames, or when the vision thread just popped it). NOT an aliveness check; the live
+  stream proved frames were flowing.
+- **Overwrote the logs** by `rm`-ing `/tmp/reception_live.log` on every restart → no trace
+  left to diagnose. **Fix: restart with a timestamped log file, never `rm`.**
+
+### Instrumented (loads on next restart)
+- `approach.py` now logs `visit RESET …` on each re-arm + a throttled
+  `visit: dom=… absent=… greet=… depart=…` every ~5s. The failure will show whether the
+  visit is stuck (greet/depart=True while `absent` never climbs = something pinning a
+  detection ≥ present_frac).
+
+### Plan for tomorrow (user present)
+1. Restart with a **timestamped log** + `capture on` (and A/B the stream on vs off per the
+   user's suspicion).
+2. Run cycles until "fire then no-fire" reproduces.
+3. Read the `visit:` trace at the failure point → confirm/refute the stuck-latch theory and
+   find *what* is pinning the detection. Then fix (candidates: re-arm on leave+return,
+   raise `present_frac`, or a max-visit timeout) — validated on a recorded clip first.
+
+> A stateless rewrite was attempted + then **rolled back** — it was a fix on an *unconfirmed*
+> root cause and it overwrote the diagnostics. Code stays on the instrumented visit-based
+> version until tomorrow's trace confirms the actual cause.
+
+### Code review (no code changes) — two compounding bugs to verify with data
+
+**Bug A — a walk-away can fire a phantom GREET, then goodbye.** Leaving the desk means
+stepping back INTO frame from the close blind spot, so the box *grows* (more of the body
+becomes visible) before it shrinks. The greet test is `area / visit_min ≥ growth_factor`,
+and `visit_min` is the *smallest area this visit* = the tiny step-into-frame sliver. So
+"grew 2.5×" isn't approaching — it's just becoming visible → false greet; then the recede
+fires goodbye. (Also: `visit_min` is permanently poisoned by ANY single small/partial/noisy
+detection.) The 3 recorded walk-away clips don't repro it — their step-in growth was ~1.23×
+(< the 1.3× threshold); the live one started closer to the desk → bigger grow-in → crossed it.
+- **Data check:** record a walk-away that STARTS right at the desk (through the blind spot);
+  replay it — does it emit a spurious `approach`?
+
+**Bug B — "no fire after" = the visit never resets** (separate bug; A just burns both latches
+at once). A greet+goodbye sets BOTH `_greet_fired` and `_depart_fired`. They re-arm only via
+`_reset_visit()`, called only when `_absent ≥ reset_absent` (40 frames = **8s of CONTINUOUS
+no-detection**; any detected frame resets `_absent` to 0). So after the combo, nothing fires
+again until 8s of clean absence. Two ways that never happens (need the trace to tell which):
+  1. **cadence** — up/away/up/away keeps someone intermittently detected, so `_absent` never
+     accumulates 8s.
+  2. **phantom detection ≥ present_frac (0.03)** — e.g. greet/goodbye `look("center")` leaving
+     the head on an object RF-DETR misreads as a person → `_absent` pinned at 0 → permanent lockup.
+- **Data check:** read the instrumented `visit: … absent=N …` trace at the no-fire point.
+  `absent` climbing toward 40 → it's #1 (cadence). `absent` stuck at 0 while you're gone → it's
+  #2 (phantom — also watch the live stream for where the head/camera is pointed).
