@@ -52,56 +52,107 @@ _FACTS_PATH = os.path.join(os.path.dirname(__file__), "clinic_facts.md")
 
 
 class ReceptionBrain:
-    """Headless ``claude -p`` agent with a receptionist persona + session memory."""
+    """A receptionist agent over ONE persistent ``claude -p`` process per conversation.
+
+    Previously each turn spawned a fresh ``claude -p`` (~2-3s startup *every* turn). Instead we
+    keep one process alive for the whole conversation via ``--input-format/--output-format
+    stream-json``: write each user turn as a JSON line on stdin, read stdout events until the
+    ``result`` event. The process keeps the conversation context itself (no ``--resume``), so
+    only the first turn pays startup; later turns are just a write+read.
+
+    NOTE: ``--input-format stream-json`` is undocumented; the input/output shapes here were
+    verified empirically against Claude Code 2.1.x (Haiku).
+    """
 
     def __init__(self, model: str = "sonnet", persona: str = PERSONA,
                  facts_path: str = _FACTS_PATH, claude_bin: str | None = None,
-                 conversation_timeout: float = 120.0):
+                 conversation_timeout: float = 120.0, turn_timeout: float = 60.0):
         self.model = model
         self.persona = self._with_facts(persona, facts_path)
-        self.session_id: str | None = None
-        # "Same conversation" = utterances arriving within conversation_timeout of
-        # each other. A longer idle gap (the visitor left) starts a fresh session on
-        # the next utterance. Simple first-pass boundary; tune or replace later.
+        # "Same conversation" = turns within conversation_timeout of each other; a longer idle
+        # gap (the visitor left) ends the process so the next turn starts a fresh conversation.
         self.conversation_timeout = conversation_timeout
-        self._last_ts: float | None = None
+        self.turn_timeout = turn_timeout
         self._bin = claude_bin or shutil.which("claude") or "claude"
+        self._proc: subprocess.Popen | None = None
+        self._last_ts: float | None = None
 
-    def respond(self, utterance: str, timeout: float = 60.0) -> str:
-        """Send one user utterance; return the receptionist's spoken reply.
+    def prewarm(self) -> None:
+        """Spawn the claude process now (pays the ~2-3s startup) so the first real turn is fast
+        — call at conversation start, e.g. while the opener is being spoken."""
+        if self._proc is None or self._proc.poll() is not None:
+            self._start()
 
-        Auto-starts a new conversation if it's been longer than
-        ``conversation_timeout`` since the last utterance.
-        """
+    def respond(self, utterance: str, timeout: float | None = None) -> str:
+        """Send one user turn to the persistent process; return the receptionist's reply.
+        Starts (or restarts) the process as needed; resets after a long idle gap."""
         now = time.monotonic()
         if self._last_ts is not None and now - self._last_ts > self.conversation_timeout:
             self.reset()  # idle gap -> new visitor / new conversation
         self._last_ts = now
 
-        # --tools "" disables every built-in tool (receptionist only talks);
-        # --exclude-dynamic... drops env info + CLAUDE.md memory on every turn so the
-        # coding-agent context can't bleed in (it did on resume turns otherwise).
-        cmd = [self._bin, "-p", "--model", self.model, "--output-format", "json",
-               "--tools", "", "--exclude-dynamic-system-prompt-sections",
-               "--setting-sources", "project"]   # drop the user-global CLAUDE.md
-        cmd += ["--system-prompt", self.persona]        # re-assert persona+facts every turn
-        if self.session_id is not None:
-            cmd += ["--resume", self.session_id]        # later turns: resume the convo
-        cmd.append(utterance)
+        if self._proc is None or self._proc.poll() is not None:
+            self._start()
+        line = json.dumps({"type": "user",
+                           "message": {"role": "user", "content": utterance}}) + "\n"
+        try:
+            self._proc.stdin.write(line)
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            self._start()  # process had died -> restart and retry once
+            self._proc.stdin.write(line)
+            self._proc.stdin.flush()
+        return self._read_reply(timeout or self.turn_timeout)
 
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, env=self._env(), cwd=_BRAIN_CWD)
-        if proc.returncode != 0:
-            raise RuntimeError(f"claude -p exit {proc.returncode}: {proc.stderr[:300]}")
-        data = json.loads(proc.stdout)
-        if data.get("is_error"):
-            raise RuntimeError(f"claude -p error: {data.get('result')}")
-        self.session_id = data.get("session_id") or self.session_id
-        return (data.get("result") or "").strip()
+    def _start(self) -> None:
+        self.reset()
+        # --tools "" = talk only; --exclude-dynamic... + project settings keep the coding-agent
+        # context from bleeding into the persona; --verbose is required for stream-json output.
+        cmd = [self._bin, "-p", "--input-format", "stream-json",
+               "--output-format", "stream-json", "--verbose",
+               "--model", self.model, "--tools", "",
+               "--exclude-dynamic-system-prompt-sections", "--setting-sources", "project",
+               "--system-prompt", self.persona]
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, env=self._env(), cwd=_BRAIN_CWD)
+
+    def _read_reply(self, timeout: float) -> str:
+        """Read stdout events until this turn's ``result`` event; return its final text."""
+        import select
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("claude -p stream: turn timed out")
+            ready, _, _ = select.select([self._proc.stdout], [], [], remaining)
+            if not ready:
+                continue
+            raw = self._proc.stdout.readline()
+            if not raw:
+                raise RuntimeError("claude -p stream: process closed stdout")
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "result":
+                if event.get("is_error"):
+                    raise RuntimeError(f"claude -p error: {event.get('result')}")
+                return (event.get("result") or "").strip()
 
     def reset(self) -> None:
-        """Forget the conversation (start a fresh session on next respond())."""
-        self.session_id = None
+        """End the conversation — terminate the persistent process (next turn starts fresh)."""
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            self._proc = None
 
     @staticmethod
     def _env() -> dict:

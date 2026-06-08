@@ -52,6 +52,7 @@ class Session:
         self._mini = None
         self._push_lock = threading.Lock()
         self._speaking = False  # True during speak(); mic listener + vision pause on it
+        self._speech_cache: dict = {}  # rendered audio for fixed lines (speak(cache=True))
 
     # --- Lifecycle ---
 
@@ -197,31 +198,44 @@ class Session:
         lang = None if language == "auto" else language
         return stt.transcribe_array(audio, sample_rate=16000, model_size=model, language=lang)
 
-    def speak(self, text: str, voice: str = "en_US-lessac-medium") -> None:
-        """Synthesize text and play through robot speaker."""
+    def speak(self, text: str, voice: str = "en_US-lessac-medium", cache: bool = False) -> None:
+        """Synthesize text and play through robot speaker. cache=True memoizes the rendered
+        audio by text — use for FIXED lines (opener/greet/goodbye/wave) so they synthesize
+        once and skip the synth on later plays; leave False for unique brain replies."""
+        self._check()
+        audio = self._render_speech(text, voice, cache)
+        if audio.size == 0:
+            return
+        self._play_speech(audio)
+
+    def _render_speech(self, text: str, voice: str, cache: bool):
+        """text -> 16kHz mono float32 with the silence lead-in. Memoized when cache=True."""
         from reachy_mini_brain import tts
 
-        self._check()
+        key = (text, voice)
+        if cache and key in self._speech_cache:
+            return self._speech_cache[key]
 
         audio, sample_rate = tts.synthesize_array(text, voice=voice)
         if audio.size == 0:
-            return
-
+            return audio
         # Resample to 16kHz
         if sample_rate != 16000:
             from scipy.signal import resample
 
             num_samples = int(len(audio) * 16000 / sample_rate)
             audio = resample(audio, num_samples).astype(np.float32)
-
         # Keep mono — MediaManager handles channel conversion
         if audio.ndim > 1:
             audio = audio[:, 0]
-
         # Prepend a short silence lead-in — the send chain swallows the first ~150ms
         # when it spins up, which was clipping the first syllable ("he" of "Hello").
         audio = np.concatenate([np.zeros(int(0.3 * 16000), dtype=np.float32), audio])
+        if cache:
+            self._speech_cache[key] = audio
+        return audio
 
+    def _play_speech(self, audio) -> None:
         # Pause the mic listener AND the vision worker for the whole playback — both
         # contend with the audio push thread, and vision (RF-DETR) contention is what
         # makes speech choppy. try/finally so a push error can't leave it stuck paused.
@@ -235,7 +249,8 @@ class Session:
             # a cushion, then pace the rest at ~real-time so the queue neither starves
             # nor overflows.
             chunk_size = 3200  # 200ms — big chunks => few push calls => robust to jitter
-            prime_samples = 16000  # ~1.0s cushion pushed up front for scheduling-jitter headroom
+            prime_samples = 6400  # ~0.4s cushion (was 1.0s) — cut to shrink the wave->voice gap;
+            # smaller = snappier first sound but more underrun risk (watch for choppy audio).
             i = 0
             while i < len(audio):
                 self.push_audio_sample(np.ascontiguousarray(audio[i : i + chunk_size]))
@@ -245,6 +260,11 @@ class Session:
             time.sleep(prime_samples / 16000.0 + 0.5)  # drain the cushion still queued
         finally:
             self._speaking = False
+
+    def prerender(self, text: str, voice: str = "en_US-lessac-medium") -> None:
+        """Synthesize + cache a FIXED line without playing it — call at startup to warm the
+        speech cache so the first opener/greet/goodbye has no synth latency (cuts startup lag)."""
+        self._render_speech(text, voice, cache=True)
 
     # --- Continuous listening ---
 

@@ -127,13 +127,13 @@ class ReceptionDaemon:
     or the shared session lifecycle. Toggle operations are idempotent.
     """
 
-    def __init__(self, session, vision_interval: float = 2.0,
-                 voice_interval: float = 3.0, perception: bool = False,
+    def __init__(self, session, vision_interval: float = 0.2,
+                 voice_interval: float = 1.5, perception: bool = False,
                  threshold: float = 0.5, gestures: bool = False,
                  greeting: str = "Welcome to Acu Genie!",
                  farewell: str = "Goodbye! Have a nice day!",
                  wave_message: str = "Hi there!",
-                 conversation_opener: str = "Hi there! How can I help you today?",
+                 conversation_opener: str = "Hi! How can I help?",
                  conv_idle_timeout: float = 45.0, conv_max_duration: float = 480.0,
                  brain: bool = False, brain_model: str = "sonnet"):
         self._session = session
@@ -179,6 +179,13 @@ class ReceptionDaemon:
 
     def start(self):
         self._session.start()
+        # Warm the speech cache for the fixed lines so the first opener/greet/goodbye/wave has
+        # no synthesis latency — cuts the wave->reaction startup lag.
+        for line in (self._greeting, self._farewell, self._wave_message, self._conversation_opener):
+            try:
+                self._session.prerender(line)
+            except Exception as e:  # noqa: BLE001
+                log.warning("prerender failed: %s", e)
 
     def stop(self):
         """Stop both workers, then the session. Workers first so they never
@@ -424,6 +431,9 @@ class ReceptionDaemon:
         log.info("voice: worker started (interval=%ss, brain=%s, conversation=%s)",
                  self._voice_interval, self._brain_enabled, self._conversation_mode)
         brain = self._make_brain() if self._brain_enabled else None
+        if brain is not None:
+            brain.prewarm()  # spawn the claude process now — it initializes while the visitor
+            # speaks their first words, so the FIRST reply isn't slowed by process startup.
         self._session.listen_start()
         start_ts = last_heard = time.monotonic()
         try:
@@ -453,9 +463,16 @@ class ReceptionDaemon:
                     last_heard = time.monotonic()
                     log.info("voice: heard %.1fs: %r", dur, text)
                     if brain is not None:
-                        reply = brain.respond(text)
-                        log.info("voice: reply: %r", reply)
-                        self._session.speak(reply)
+                        think_stop = threading.Event()
+                        threading.Thread(
+                            target=self._think_animate, args=(think_stop,), daemon=True
+                        ).start()
+                        try:
+                            reply = brain.respond(text)
+                            log.info("voice: reply: %r", reply)
+                            self._session.speak(reply)  # antennas auto-stop when voice starts
+                        finally:
+                            think_stop.set()
                 except Exception as e:  # noqa: BLE001
                     log.warning("voice: error %s", e)
         finally:
@@ -533,7 +550,7 @@ class ReceptionDaemon:
         Antennas are separate joints (not in the camera view) so they're safe to keep."""
         for action in (
             lambda: self._session.antennas(20, 20),
-            lambda: self._session.speak(message),
+            lambda: self._session.speak(message, cache=True),
             lambda: self._session.antennas(0, 0),
         ):
             try:
@@ -542,6 +559,27 @@ class ReceptionDaemon:
                 log.warning("express: action error %s", e)
         log.info(done_log)
         return result
+
+    def _think_animate(self, stop_evt: threading.Event) -> None:
+        """Wiggle the antennas to signal 'thinking' during the heard->reply gap.
+
+        Fills the dead time (brain call + TTS synth) so the robot doesn't look frozen.
+        Stops the instant reply audio starts (session._speaking flips True) or stop_evt
+        is set, then resets antennas to neutral. Antennas only — the camera rides on the
+        head, so we never move it mid-turn."""
+        poses = ((25, 10), (10, 25))  # gentle alternating sway
+        i = 0
+        while not stop_evt.is_set() and not getattr(self._session, "_speaking", False):
+            try:
+                self._session.antennas(*poses[i % len(poses)])
+            except Exception:  # noqa: BLE001
+                pass
+            i += 1
+            stop_evt.wait(0.3)
+        try:
+            self._session.antennas(0, 0)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _alive(t: threading.Thread | None) -> bool:
@@ -707,8 +745,11 @@ def cli():
 
 @cli.command()
 @click.option("--mock", is_flag=True, help="Use a fake session (no SDK/robot).")
-@click.option("--vision-interval", default=2.0, help="Seconds between frame grabs.")
-@click.option("--voice-interval", default=3.0, help="Seconds between mic reads.")
+@click.option("--vision-interval", default=0.2,
+              help="Seconds between frame grabs (~5 fps). The approach/depart geometry is "
+                   "calibrated for this — 2.0 (0.5 fps) stretches reset_absent 8s->80s and breaks greet/goodbye.")
+@click.option("--voice-interval", default=1.5,
+              help="Seconds between mic reads — lower = faster turn-taking (VAD endpointing is the deeper fix).")
 @click.option("--perception/--no-perception", default=False,
               help="Run the RF-DETR person/approach pipeline in the vision worker.")
 @click.option("--threshold", default=0.5, help="Detector confidence threshold.")

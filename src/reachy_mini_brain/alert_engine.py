@@ -30,7 +30,7 @@ def _tail(path: Path, from_end: bool = True):
         while True:
             line = f.readline()
             if not line:
-                time.sleep(0.3)
+                time.sleep(0.1)  # poll fast — this is on the wave->reaction critical path
                 continue
             line = line.strip()
             if not line:

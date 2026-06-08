@@ -10,6 +10,58 @@ Each entry uses three buckets:
 
 ---
 
+## 2026-06-08 — Phase C voice loop + wave→conversation LIVE-validated; greet/goodbye low-fire-rate root-caused to a dropped fps flag; conversation startup-lag reduced + "thinking" antenna UX
+
+**Setup:** robot recovered (was in `state: error` "Motor communication error" overnight; the user
+restarted it + updated its SDK to **1.8.0**). Our SDK was 1.5.0 → version mismatch → our daemon's
+`ReachyMini()` failed; **matched to 1.8.0** and it connected. Daemon launched **from a GUI-rooted
+tmux session** so `brain.py`'s `claude -p` is keychain-authed (the Phase C auth fix).
+
+### 🟢 Good
+- **Phase C voice loop validated (first pass).** listen → faster-whisper STT → `claude -p` (Haiku)
+  brain → speak. Fact-grounded + in-character (e.g. restroom location verbatim from `clinic_facts.md`,
+  no hallucination on absent departments). claude -p authed via the tmux daemon.
+- **Wave → conversation wired + validated end-to-end.** wave (`Open_Palm`) → `start_conversation`:
+  opener spoken → voice/brain loop (conversation mode) → multi-turn → **interaction gate** (daemon
+  suppresses `react`/`farewell` while a conversation is active — proven: `react: suppressed`) →
+  **idle close** (`conversation ended (idle 46s)`) / 480s max cap.
+- **Conversation startup-lag reduced + made to *feel* responsive (afternoon session).** Three
+  fixes, live-validated: (1) **brain prewarm** — the `claude -p` process is spawned at the start
+  of the voice worker so the FIRST reply no longer pays cold-start; live per-turn `heard→reply`
+  dropped ~3s → **1–2s**. (2) **Opener audio cushion cut** 1.0s → 0.4s (`_play_speech` prime) —
+  opener "feels quicker" off the wave (the opener is already pre-rendered, so the cushion was its
+  dominant latency). (3) **"Thinking" antenna animation** — antennas sway during the `heard→reply`
+  dead time (brain call + TTS synth) and settle to neutral the instant reply audio starts (gated
+  on `session._speaking`, so motion flows straight into speech). User: **"much better UX."**
+
+### 🟡 Ugly
+- **Per-turn latency is structural (~4–6s) — now *masked*, not removed.** Traced the `you stop
+  talking → you hear the reply` gap to a **serial 4-stage pipeline**: mic-poll wait (≤1.5s — the
+  loop reads the mic on a fixed `--voice-interval` timer, no endpointing) + STT/faster-whisper
+  (~1s) + brain/Haiku (~1.5–2s) + TTS-start synth+cushion (~1s). No single villain — it's the sum.
+  The thinking-antenna fills the dead air so it *reads* as "thinking," and prewarm/cushion shaved
+  the worst, but the real fix is **VAD endpointing + a streaming STT/LLM/TTS stack**
+  (see `voice-ai-research.md`) — deferred.
+- **STT quality variable** — clean when close/clear single utterances, garbled when continuous/far.
+- **Wave needs a min distance** (scores hover near the 0.5 floor).
+
+### 🔴 Bad → root-caused + fixed: greet/goodbye **fire rate very low**
+- Symptom: after restarts today, greet/goodbye barely fired; the visit-state trace showed `greet`/
+  `depart` latches **stuck True for ~7 min** without re-arming.
+- **Root cause = a dropped flag, NOT the code/position.** The tmux launches I wrote **omitted
+  `--vision-interval 0.2`**, so the daemon ran at the **2.0s default = 0.5 fps** (yesterday's working
+  daemon was 5 fps). `reset_absent` is **40 frames** → at 0.5 fps that's **~80s** of continuous
+  absence to re-arm (vs ~8s at 5 fps), so visits almost never reset → latches stuck → low fire rate.
+- **Fix:** restored 5 fps; at 5 fps the RESET fires (`visit RESET (absent 40 frames)`) and greet/
+  goodbye work. **Changed the default `--vision-interval` 2.0 → 0.2** so a launch without the flag
+  can't silently break it again.
+- **Process note (mine):** I first over-asserted the *visit-latch design* as the cause. The user
+  correctly pushed back ("code unchanged, worked yesterday; I moved its position") — the real
+  variable was the frame rate. Confirmed via the record-fps hint ("~0.5 fps"). *(Don't assert a
+  root cause when an unchanged-code symptom appears — find what actually changed.)*
+
+---
+
 ## 2026-06-07 — wave detection LIVE-validated; recording/persistence hardened; greet/goodbye FP confirmed on record; Phase C auth pinned
 
 **Setup:** m1max daemon (`serve --perception --gestures`), vision + stream on, alert engine.

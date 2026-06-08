@@ -290,6 +290,18 @@ unblocked.
 - **FAQ knowledge** — currently facts-in-persona (Haiku drifts); add an authoritative
   FAQ tool. Phase C polish.
 - **STT reliability** — still faster-whisper; the "Reachy" mishear issue stands.
+- **Conversation STARTUP lag — the lag that matters.** The serious lag is **wave → reaction**
+  (the opener / conversation init), NOT between turns — per-turn lag (~3s) is acceptable for a
+  first pass. Startup ≈ ~4s: alert poll + opener TTS (synth + ~1.3s buffer cushion + ~2.5s
+  sentence playback). Fix candidates: pre-synth opener (done — cached), a **shorter opener**
+  and/or an **instant non-verbal ack** (antenna flick) before the verbal line, trim the opener
+  buffer cushion. (Logs confirm per-turn ≈ 3s regardless of process model — i.e. it's the
+  model/CLI call, not spawn; the persistent brain doesn't move it.)
+- **Brain persona too rigid (DEFERRED).** Replies act like a "stupid robot" — too rigid /
+  deflecting / repetitive, not human-like. Loosen the persona (warmer, more natural, less
+  scripted) — Phase C polish. **Memory across a short conversation is REQUIRED (non-negotiable):**
+  the brain keeps **one persistent `claude -p` process (stream-json) per conversation** so it
+  remembers the turns — do NOT revert to a stateless/per-turn model.
 - **Approach/depart robustness — candidate fixes (NOT committed; validate offline first).**
   Aimed at the live false-greets: sitting still, small body movements, and edge-of-frame
   in/out flicker all tripping greet. Three options, cheapest first:
