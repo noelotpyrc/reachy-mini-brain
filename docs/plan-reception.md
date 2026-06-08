@@ -316,18 +316,37 @@ unblocked.
     before any live change. These are also the cheap deterministic *baseline that a future
     learned classifier (VLM-auto-labeled event data — discussed, not yet written up) would
     have to beat* — try cheap first.
-- **Wave → conversation (Feature 2)** — **detection half DONE + live-validated (2026-06-07).**
-  `gesture.py` wraps MediaPipe's **Gesture Recognizer** (`Open_Palm`, score ≥ 0.5, pretrained
-  `gesture_recognizer.task`); `perception --gestures` emits a debounced `wave` event; alert
-  engine maps `wave → wave_back` ("Hi there!", a placeholder distinct from the greet). Works
-  end-to-end on the robot (scores 0.61–0.73). **Open:** (a) needs a minimum hand distance;
-  (b) the real trigger — `wave → start conversation` — still waits on Phase C; (c) waving
-  collides with the approach/depart FP (greet+goodbye misfire while you stand there) → wants
-  the interaction gate from "Approach/depart robustness" above.
+- **Wave → conversation (Feature 2)** — **wired (first pass, 2026-06-08).** Detection
+  (`gesture.py`, MediaPipe `Open_Palm`, live-validated 0.61–0.73) → `wave` event → alert engine
+  maps **`wave → start_conversation`**: speak an opener ("Hi there! How can I help you today?")
+  then start the voice/brain loop. **End = idle timeout (45s) OR a max-duration cap (120s)**,
+  whichever first. (`reception converse` triggers it manually.) Needs `--brain` + a keychain-authed
+  context for `claude -p` (the daemon run from tmux). **Interaction gate DONE:** while a conversation
+  is active (`_conversation_mode`), `react`/`farewell` are suppressed in the daemon — so
+  approach/depart can't greet/goodbye over the conversation; auto-resumes on close. **Open:** (a)
+  min hand distance; (b) **idle-close is background-noise-vulnerable** — STT transcribes ambient
+  sound as `heard`, resetting the idle timer, so a noisy room rides to the max cap. *Fix (v2 below).*
+- **Speaker-aware conversation close (v2 — the proper noise fix).** Vision can't gate this (the
+  robot hears omnidirectionally — a visitor can talk from behind it), and `faster-whisper` only
+  transcribes (no speaker ID). Add a **speaker-embedding / diarization** step (pyannote /
+  SpeechBrain ECAPA / Resemblyzer): on the first utterance capture the talker's **voice
+  fingerprint**, then reset the idle timer **only when that voice speaks** → conversation closes
+  N s after the *real talker's* last words, ignoring background noise. Lighter alt: the robot's
+  **mic-array DOA** (`doa` → `{angle, speech_detected}`) to gate on the talker's direction /
+  detected-speech. Pairs with the deferred STT/VAD work.
 - **Head roll calibration (~8°)** — commanding roll 0 ("level") physically sits ~8° tilted; a
   robot calibration offset (motors fine, head responds). Camera is head-mounted, so it tilts
   every frame. Workaround: command roll ≈ −5.7°. Proper fix = recalibrate via official tooling;
   deferred. Note: `reset` commands true-zero, so it currently *re-tilts*.
+- **Health-check / heartbeat process (ops continuity)** — a lightweight, separate process
+  (like the alert engine) that periodically (~30–60s) polls and **appends a timestamped status
+  line to a health log** (`artifacts/logs/health-<ts>.log`): reception daemon up? robot REST
+  `:8000` `state` (running/error + the error string)? session `connected` / `video_ready` /
+  `audio_ready`? events.jsonl advancing? alert engine up? Purpose: a persistent health history
+  so degradations/deaths leave a **timestamped trace** for continued ops — the gap we just hit
+  (daemon died overnight, robot in a motor-error state, *no record of when or how*). Later:
+  notify on state change (running→error) and/or auto-restart on defined failures (overlaps the
+  Phase E reconnect/supervisor work). Phase E.
 - **Remote control** — Tailscale-exposed control endpoint for staff. Phase E.
 
 ---

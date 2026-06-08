@@ -133,6 +133,8 @@ class ReceptionDaemon:
                  greeting: str = "Welcome to Acu Genie!",
                  farewell: str = "Goodbye! Have a nice day!",
                  wave_message: str = "Hi there!",
+                 conversation_opener: str = "Hi there! How can I help you today?",
+                 conv_idle_timeout: float = 45.0, conv_max_duration: float = 480.0,
                  brain: bool = False, brain_model: str = "sonnet"):
         self._session = session
         self._vision_interval = vision_interval
@@ -143,6 +145,10 @@ class ReceptionDaemon:
         self._greeting = greeting
         self._farewell = farewell
         self._wave_message = wave_message
+        self._conversation_opener = conversation_opener
+        self._conv_idle_timeout = conv_idle_timeout
+        self._conv_max_duration = conv_max_duration
+        self._conversation_mode = False
         self._brain_enabled = brain
         self._brain_model = brain_model
         self._lock = threading.Lock()
@@ -392,17 +398,18 @@ class ReceptionDaemon:
 
     # --- voice toggle ---
 
-    def voice_on(self) -> str:
+    def voice_on(self, conversation: bool = False) -> str:
         with self._lock:
             if _alive(self._voice_thread):
                 return "voice already on"
+            self._conversation_mode = conversation
             self._voice_stop = threading.Event()
             self._voice_thread = threading.Thread(
                 target=self._voice_loop, args=(self._voice_stop,),
                 name="voice", daemon=True,
             )
             self._voice_thread.start()
-            return "voice on"
+            return "voice on" + (" (conversation)" if conversation else "")
 
     def voice_off(self) -> str:
         with self._lock:
@@ -414,15 +421,28 @@ class ReceptionDaemon:
         return "voice off"
 
     def _voice_loop(self, stop: threading.Event):
-        log.info("voice: worker started (interval=%ss, brain=%s)",
-                 self._voice_interval, self._brain_enabled)
+        log.info("voice: worker started (interval=%ss, brain=%s, conversation=%s)",
+                 self._voice_interval, self._brain_enabled, self._conversation_mode)
         brain = self._make_brain() if self._brain_enabled else None
         self._session.listen_start()
+        start_ts = last_heard = time.monotonic()
         try:
             while not stop.is_set():
                 stop.wait(self._voice_interval)
                 if stop.is_set():
                     break
+                # Conversation auto-end: idle (talker silent) OR a hard max-duration cap.
+                # FIRST PASS: idle resets on ANY transcript, so background noise heard-as-text
+                # can hold it open — the max cap bounds that. Speaker-aware close (reset only
+                # on the enrolled talker's voice) is the planned v2.
+                if self._conversation_mode:
+                    now = time.monotonic()
+                    if now - last_heard > self._conv_idle_timeout:
+                        log.info("voice: conversation ended (idle %.0fs)", now - last_heard)
+                        break
+                    if now - start_ts > self._conv_max_duration:
+                        log.info("voice: conversation ended (max cap %.0fs)", now - start_ts)
+                        break
                 try:
                     res = self._session.listen_read()
                     dur = res.get("buffer_duration", 0.0)
@@ -430,6 +450,7 @@ class ReceptionDaemon:
                     if not text:
                         log.info("voice: %.1fs buffered (silence)", dur)
                         continue
+                    last_heard = time.monotonic()
                     log.info("voice: heard %.1fs: %r", dur, text)
                     if brain is not None:
                         reply = brain.respond(text)
@@ -442,6 +463,7 @@ class ReceptionDaemon:
                 self._session.listen_stop()
             except Exception as e:  # noqa: BLE001
                 log.warning("voice: listen_stop error %s", e)
+            self._conversation_mode = False
             log.info("voice: worker stopped")
 
     def _make_brain(self):
@@ -471,6 +493,9 @@ class ReceptionDaemon:
 
     def react(self) -> str:
         """Greet an approaching visitor."""
+        if self._conversation_mode:
+            log.info("react: suppressed (conversation active)")
+            return "suppressed (in conversation)"
         return self._express(self._greeting, "react: greeted visitor", "reacted")
 
     def reset(self) -> str:
@@ -483,12 +508,24 @@ class ReceptionDaemon:
 
     def farewell(self) -> str:
         """Say goodbye to a departing visitor."""
+        if self._conversation_mode:
+            log.info("farewell: suppressed (conversation active)")
+            return "suppressed (in conversation)"
         return self._express(self._farewell, "farewell: said goodbye", "farewelled")
 
     def wave_back(self) -> str:
         """Acknowledge a wave — a DISTINCT response from the approach greeting so the
         two are easy to tell apart when testing wave detection."""
         return self._express(self._wave_message, "wave_back: acknowledged a wave", "waved back")
+
+    def start_conversation(self) -> str:
+        """Wave-triggered: BEGIN a conversation — speak an opener, then start the voice/brain
+        loop (which auto-ends on idle or the max-duration cap). Idempotent while one is active.
+        Needs --brain + a keychain-authed context for claude -p (e.g. the daemon run from tmux)."""
+        if _alive(self._voice_thread):
+            return "already in conversation"
+        self._express(self._conversation_opener, "conversation: opened", "opened")
+        return self.voice_on(conversation=True)
 
     def _express(self, message: str, done_log: str, result: str) -> str:
         """Flick antennas, speak, reset antennas. Deliberately does NOT move the head:
@@ -517,7 +554,8 @@ def _alive(t: threading.Thread | None) -> bool:
 
 # daemon methods callable over the socket
 _COMMANDS = {"vision_on", "vision_off", "voice_on", "voice_off", "status", "react",
-             "farewell", "reset", "wave_back", "capture_on", "capture_off", "record_on", "record_off",
+             "farewell", "reset", "wave_back", "start_conversation",
+             "capture_on", "capture_off", "record_on", "record_off",
              "stream_on", "stream_off"}
 
 
@@ -730,8 +768,14 @@ def farewell():
 
 @cli.command()
 def wave():
-    """Trigger the wave acknowledgment — distinct from the greeting (alert engine fires this on a wave)."""
+    """Trigger the wave acknowledgment (manual; standalone "Hi there!", no conversation)."""
     _run_client("wave_back")
+
+
+@cli.command()
+def converse():
+    """Begin a conversation (opener + voice loop) — what a wave now triggers."""
+    _run_client("start_conversation")
 
 
 @cli.command()
