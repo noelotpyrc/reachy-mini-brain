@@ -10,6 +10,79 @@ Each entry uses three buckets:
 
 ---
 
+## 2026-06-09 — head recalibration; pydantic brain live; streaming-TTS rejected; VAD endpointing FIXES the STT garble; turn-capture for debug
+
+**Setup:** m1max daemon, many restart cycles. Robot recalibrated mid-session via the Reachy app.
+
+### 🟢 Good
+- **VAD endpointing (Silero) + `medium` STT → clean single-utterance turns.** Each `heard` is now ONE
+  complete utterance (1–5s, speech-start→silence) instead of 1.5s fragments or 15s multi-speaker blobs.
+  Validated over a ~14-turn live conversation — natural flow, brain handled clean input well (it even
+  caught its own ambiguity: "I said friendly *faces*, not friends"; privacy guardrail on patient names).
+  The STT garble that wrecked earlier conversations is fixed at the *listen* layer (silero-vad +
+  utterance-queue `listen_read` + voice-loop rewire; uncommitted).
+- **Pydantic-AI brain runs live on the robot** (step D) — gpt-oss-20b via OpenRouter, wave→conversation,
+  in-character, memory; **no keychain/tmux hack**. m1max got `pydantic-ai-slim[openai]` + the `.env` key.
+  See `docs/brain-backend-research.md`.
+- **Head recalibration (Reachy app) leveled the head** (roll 7.5°→~0°); `reset` is deterministic
+  (body yaw exact ±0.2°). See `docs/head-pose-calibration-notes.md`.
+- **`--save-turns` debug capture built** — per-turn utterance WAV + heard/reply → `artifacts/turns/`,
+  to attribute off replies to STT vs brain.
+
+### 🟡 Ugly
+- **gpt-oss-20b latency spikes** — mostly 1–3s/turn, occasional 9–14s (its measured spikiness).
+- **`medium` STT ~2s/utterance** — accurate but slow; `turbo`/`small` would be faster (→ STT-replacement
+  research underway; this model is the suspected weak link).
+- **STT still mis-transcribes short/fast/mumbled speech even with VAD** (e.g. "Also they're going" → an
+  off reply). The brain mostly reacts correctly to bad text, so **STT is the weak link**.
+- **Head orientation ~±6–7° non-repeatable** (matrix-confirmed); body exact. Use the 4×4-matrix API,
+  not euler. See `docs/head-pose-calibration-notes.md`.
+
+### 🔴 Bad → resolved / rejected
+- **Streaming TTS = choppy → REJECTED.** Chunked render-ahead over the WebRTC pipeline starves the audio
+  thread → "choppiest voice ever." Kept whole-utterance `speak()` + the thinking-antenna mask. See
+  `voice-ai-research.md`.
+- **STT garble (no endpointing)** → root-caused + **FIXED** by the VAD endpointer (above).
+
+### Process notes (mine)
+- Jumped from VAD code straight into a live mic test without confirming someone was there → captured the
+  room's **noise floor** (±0.04 RMS) → wrongly concluded "the Reachy mic runs quiet" + added a gain hack.
+  A real speech test (after asking) showed the VAD works at the **default threshold, no gain**. *Lesson:
+  ask before live tests that need the user; don't conclude from data taken in the wrong conditions.*
+
+---
+
+## 2026-06-08 (eval, not on-robot) — Brain backend trial: `agy` (Antigravity CLI) + Gemini 3.5 Flash → REJECTED
+
+**Context:** Evaluated swapping the conversation brain from `claude -p` (Haiku) to **`agy`** (Google's
+"Antigravity" agentic CLI) on **Gemini 3.5 Flash**. Dev-machine only (agy isn't on m1max yet);
+**`brain.py` was NOT changed** — throwaway tests in `/tmp`.
+
+### 🔴 Decision: do NOT adopt — keep the `claude -p` brain.
+**~2–3s/turn slower with no offsetting benefit, on a brittle CLI.**
+
+### Findings (kept in case revisited)
+- **Latency:** bare `agy -p` ≈ **3–5s/turn** (default ≈ Low ≈ ~3s — the tier override does *not* speed
+  it up). Current **claude/Haiku** ≈ **1–2s/turn**. agy is slower because it has **no persistent
+  process** — each turn = a fresh CLI spawn + model call (claude spawns once and reuses it).
+- **Derails on ANY flag.** `--model`, `-c`/`--continue`, `--print-timeout` each make agy introspect its
+  own invocation (lists files, opens its sqlite conversation DBs, documents its own flags) instead of
+  replying. **Only bare `agy -p "<prompt>"` chats reliably**; bound runtime with a `timeout` *wrapper*,
+  never `--print-timeout`.
+- **Model:** default is already **Gemini 3.5 Flash** (self-reported). Tier *maybe* settable via env
+  `CASCADE_DEFAULT_MODEL_OVERRIDE` (sets cleanly but unverified it changes the tier — the self-report is
+  a baked-in "Antigravity powered by Gemini Flash" identity, so it can't confirm).
+- **Memory:** agy's own `--continue` persists conversations (sqlite under `~/.gemini/antigravity-cli/`)
+  but derails; **client-managed history** (persona + transcript embedded in each bare prompt) is clean
+  and **recalls correctly** across turns — the approach we'd have used.
+- **Quality (when bare):** clean, in-character, fact-grounded (recalled "Dr. Park"; gave restrooms +
+  hours from the embedded facts). The model is fine — the **CLI** is the blocker.
+
+**If revisited:** a direct **Gemini API** call (`google-genai`: system prompt = persona, no tools,
+managed history) would sidestep the CLI fragility entirely and could be faster — but that wasn't the ask.
+
+---
+
 ## 2026-06-08 — Phase C voice loop + wave→conversation LIVE-validated; greet/goodbye low-fire-rate root-caused to a dropped fps flag; conversation startup-lag reduced + "thinking" antenna UX
 
 **Setup:** robot recovered (was in `state: error` "Motor communication error" overnight; the user

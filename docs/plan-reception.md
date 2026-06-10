@@ -289,7 +289,15 @@ unblocked.
   events; not needed for the MVP. Phase B+.
 - **FAQ knowledge** — currently facts-in-persona (Haiku drifts); add an authoritative
   FAQ tool. Phase C polish.
-- **STT reliability** — still faster-whisper; the "Reachy" mishear issue stands.
+- **STT — VAD endpointing DONE; model replacement is the NEXT STT work.** (2026-06-09) Added a
+  **Silero-VAD endpointer** so each turn is one clean utterance — fixed the fragment/15s-garble problem
+  (live-validated); bumped to faster-whisper `medium`. But `medium` is **batch + ~2s/utterance** and
+  still fumbles short/fast/mumbled speech → off replies, so **STT is now the bottleneck.** Replacement
+  candidates (detail + table in `voice-ai-research.md`): **(1) quick** `medium → large-v3-turbo`
+  (one-line, faster + more accurate); **(2) real fix** `parakeet-mlx` (NVIDIA Parakeet on Apple Silicon,
+  ~80 ms local, accurate, private); **(3) cloud** AssemblyAI (noise-robust + intelligent endpointing).
+  Also added **`--save-turns`** debug capture (per-turn WAV + heard/reply) to attribute off replies to
+  STT vs brain. *(My lean: try large-v3-turbo first, then parakeet-mlx.)*
 - **Conversation STARTUP lag — the lag that matters.** The serious lag is **wave → reaction**
   (the opener / conversation init), NOT between turns — per-turn lag (~3s) is acceptable for a
   first pass. Startup ≈ ~4s: alert poll + opener TTS (synth + ~1.3s buffer cushion + ~2.5s
@@ -346,10 +354,10 @@ unblocked.
   N s after the *real talker's* last words, ignoring background noise. Lighter alt: the robot's
   **mic-array DOA** (`doa` → `{angle, speech_detected}`) to gate on the talker's direction /
   detected-speech. Pairs with the deferred STT/VAD work.
-- **Head roll calibration (~8°)** — commanding roll 0 ("level") physically sits ~8° tilted; a
-  robot calibration offset (motors fine, head responds). Camera is head-mounted, so it tilts
-  every frame. Workaround: command roll ≈ −5.7°. Proper fix = recalibrate via official tooling;
-  deferred. Note: `reset` commands true-zero, so it currently *re-tilts*.
+- **Head roll calibration — RESOLVED (2026-06-09).** Recalibrated via the Reachy app; commanding
+  level now sits ~0° (was ~7.5°). `reset` confirmed deterministic (body yaw exact ±0.2°; head
+  *orientation* ~±6–7° non-repeatable — use the **4×4-matrix API, not euler**, for pose work).
+  See `docs/head-pose-calibration-notes.md`.
 - **Health-check / heartbeat process (ops continuity)** — a lightweight, separate process
   (like the alert engine) that periodically (~30–60s) polls and **appends a timestamped status
   line to a health log** (`artifacts/logs/health-<ts>.log`): reception daemon up? robot REST

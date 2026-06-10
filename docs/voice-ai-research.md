@@ -88,6 +88,60 @@ For short customer QnA the sandwich is frequently favored; full-duplex wins on c
   - Cost/latency numbers to set budgets against the current local baseline.
   - Guardrails + handoff patterns for unattended reception use.
 
+## Streaming-TTS experiment (2026-06-09) — chunked TTS over our WebRTC pipeline = CHOPPY (deferred)
+
+**Goal:** cut per-turn time-to-first-audio by speaking sentence-by-sentence (render-ahead) instead of
+synthesizing the whole reply before any sound. Tested on the **real robot** (`experiments/stream_speak_test.py`),
+not a mock.
+
+**Measured win (real):** piper synth of the whole 3-sentence reply = **1.30s** vs sentence-1 = **0.06s**
+→ first audio **~1.2s sooner**. Built a continuous-push streaming player (cushion at start, drain only at
+end, render-ahead) so totals stayed ~equal (baseline 13.70s vs streamed 13.95s).
+
+**Fatal flaw:** the audio was **badly choppy** ("choppiest voice I've heard"). Our smooth playback depends
+on three things at once — a primed cushion + ONE steady push of a whole utterance + pausing vision/mic so
+CPU contention can't starve the audio thread. Streaming breaks all three: it feeds the WebRTC pipeline
+**incrementally**, the 0.4s cushion was tuned for whole utterances, and it **synthesizes the next sentence
+while the current one plays** → the audio push thread gets starved → constant underruns → chop.
+
+**Methodology lesson:** the wall-clock "totals are equal → no gaps" metric **completely missed** the
+choppiness — only the ear, on the real robot, caught it. **Audio smoothness must be judged by ear on the
+robot, never inferred from timing.** (Reinforces: test voice on hardware, not a mock.)
+
+**Decision:** **dropped for now.** Keep the smooth whole-utterance `speak()` (what the claude + pydantic
+brains already do) and mask the synth+LLM latency with the **thinking-antenna**. Smooth ≫ 1.2s faster.
+
+**Future research (when it's time):** how do production stacks stream TTS *smoothly*? Look at — jitter/audio
+buffers kept ahead of real-time; synth decoupled onto a separate process/core; streaming-capable TTS
+(Cartesia/Deepgram/ElevenLabs streaming, or piper streaming output); and how **LiveKit/Pipecat** feed
+WebRTC audio without underruns. The ~1.2s win is real *if* the smoothness problem is solved.
+
+## STT replacement research (2026-06-09) — Whisper/faster-whisper is the weak link
+
+Current: faster-whisper `medium`, **batch** (we hack a Silero-VAD endpointer around it), ~2s/utterance,
+and it mis-transcribes short/fast/mumbled speech → off brain replies (e.g. "Also they're going"). The
+brain mostly reacts correctly to bad text, so **STT is the bottleneck.**
+
+### Options (for m1max = Apple Silicon; short, clean, VAD-endpointed utterances; local preferred)
+| Option | Where | Latency | Accuracy (WER) | Notes |
+|---|---|---|---|---|
+| **Parakeet-TDT via `parakeet-mlx`** | local, M-series (MLX) | **~80ms** | strong | NVIDIA Parakeet on Apple Silicon; ~1h audio in ~53s; streaming. **Biggest local win.** (Also FluidAudio → CoreML/Neural Engine.) |
+| **Moonshine v2** | local (ONNX/torch) | ~107ms | 6.65% (> Whisper L-v3) | purpose-built for **real-time short utterances**, tiny (27–245MB), low hallucination. Mac support less mature than Parakeet. |
+| **whisper-large-v3-turbo** | local (faster-whisper) | ~6× faster than L-v3 | ~6.7% | **drop-in** one-line model swap for our faster-whisper; still batch; easiest test. |
+| **Voxtral (Mistral)** | local | streaming | **5.9%** (best OSS) | 4B, Apache-2.0, native streaming; bigger. |
+| **AssemblyAI Universal-Streaming** | cloud | ~150ms P50 (post-VAD) | top; **73% fewer noise false-outputs** vs Deepgram Nova-2 | intelligent endpointing (acoustic+semantic) → could replace our Silero VAD; noise-robust. |
+| **Deepgram Nova-3 / Flux** | cloud | 150–300ms | 5.26% | Flux = lowest end-of-speech latency; Voice-Agent API bundles STT/TTS/LLM. |
+
+### Recommendation
+1. **Quick test (no new deps):** swap faster-whisper `medium → large-v3-turbo` — faster + more accurate
+   than medium in one line; sets the easy ceiling.
+2. **The real upgrade (local):** **`parakeet-mlx`** — ~80ms on m1max (vs our ~2s), accurate, private, no
+   cloud. Strongest fit for a local fast receptionist STT. (Moonshine is the short-utterance specialist
+   alternative if Parakeet underwhelms on our audio.)
+3. **If noise/accuracy still hurts:** evaluate **AssemblyAI** (cloud) — noise-robust + intelligent
+   endpointing (could replace Silero too). The brain is already cloud (OpenRouter), so cloud STT is not a
+   privacy regression.
+
 ## Sources & Further Reading (X posts)
 
 Key discussions drawn from semantic and keyword searches on X (handles including @livekit, @kwindla / Pipecat, @LangChain, @saranormous, @aakashgupta, individual builders, etc.). Specific high-signal posts covered:
