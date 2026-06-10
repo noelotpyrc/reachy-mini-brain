@@ -14,8 +14,10 @@ Two modes:
 
 from __future__ import annotations
 
+import collections
 import json
 import os
+import queue
 import signal
 import socket
 import sys
@@ -268,58 +270,55 @@ class Session:
 
     # --- Continuous listening ---
 
-    def listen_start(self, model: str = "base", language: str = "en") -> str:
-        """Start continuous background listening.
+    def listen_start(self, model: str = "medium", language: str = "en") -> str:
+        """Start continuous VAD-endpointed listening.
 
-        A daemon thread buffers raw audio from the mic.
-        Call listen_read() to transcribe and retrieve what's been said.
+        A daemon thread runs Silero VAD over the mic stream and emits ONE COMPLETE
+        utterance (speech-start..speech-end) at a time to an internal queue — so each
+        turn is a clean single utterance, not an arbitrary time-slice. Call listen_read()
+        to pull + transcribe the next complete utterance.
         """
         self._check()
         if hasattr(self, "_listen_thread") and self._listen_thread.is_alive():
             return "already listening"
 
         self._listen_stop = threading.Event()
-        self._listen_buffer: list[np.ndarray] = []
-        self._listen_lock = threading.Lock()
+        self._utterance_q: queue.Queue = queue.Queue()
         self._listen_model = model
         self._listen_language = language
         self._speaking = False  # set by speak() to flag own-voice audio
-        self._listen_thread = threading.Thread(
-            target=self._listen_loop, daemon=True,
+        from silero_vad import load_silero_vad, VADIterator
+
+        self._vad_iter = VADIterator(
+            load_silero_vad(onnx=True), sampling_rate=16000,
+            threshold=0.5, min_silence_duration_ms=700,
         )
+        self._listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._listen_thread.start()
         return "listening"
 
-    def listen_read(self) -> dict:
-        """Transcribe and return buffered audio, then clear the buffer.
-
-        Returns {"text": str, "buffer_duration": float}.
-        buffer_duration is seconds of audio in the chunk.
-        Empty text if silence/nothing buffered.
+    def listen_read(self, timeout: float = 1.0) -> dict:
+        """Block up to `timeout`s for the next COMPLETE utterance (VAD-endpointed), then
+        transcribe it. Returns {"text": str, "buffer_duration": float}; empty text if no
+        utterance arrived within the timeout.
         """
-        if not hasattr(self, "_listen_lock"):
+        if not hasattr(self, "_utterance_q"):
             return {"text": "", "buffer_duration": 0.0}
-
-        with self._listen_lock:
-            chunks = list(self._listen_buffer)
-            self._listen_buffer.clear()
-
-        if not chunks:
+        try:
+            audio = self._utterance_q.get(timeout=timeout)
+        except queue.Empty:
             return {"text": "", "buffer_duration": 0.0}
 
         from reachy_mini_brain import stt
 
-        audio = np.concatenate(chunks)
         if audio.ndim > 1:
             audio = audio[:, 0]
-
         buffer_duration = round(len(audio) / 16000.0, 2)
-
         lang = None if self._listen_language == "auto" else self._listen_language
         text = stt.transcribe_array(
             audio, sample_rate=16000, model_size=self._listen_model, language=lang,
         )
-        return {"text": text, "buffer_duration": buffer_duration}
+        return {"text": text, "buffer_duration": buffer_duration, "audio": audio}
 
     def listen_stop(self) -> str:
         """Stop continuous background listening."""
@@ -330,13 +329,62 @@ class Session:
         return "stopped"
 
     def _listen_loop(self) -> None:
-        """Background thread: buffer raw audio samples from the mic."""
+        """Background thread: Silero-VAD endpointer.
+
+        Feeds the mic stream to VADIterator in 512-sample (32ms) windows, collects audio
+        from speech-start to speech-end (with a short pre-roll so onsets aren't clipped),
+        and puts each COMPLETE utterance on _utterance_q. Pauses + resets while the robot
+        speaks (no self-hearing). A max-length cap bounds a never-ending utterance.
+        """
+        WIN = 512                              # Silero window @ 16kHz
+        PREROLL = 8                            # ~256ms kept before speech start
+        MIN_WINS = 8                           # ignore blips < ~0.25s
+        MAX_WINS = int(15 * 16000 / WIN)       # force-emit after ~15s of continuous speech
+        pre: collections.deque = collections.deque(maxlen=PREROLL)
+        utt: list = []
+        collecting = False
+        pending = np.zeros(0, dtype=np.float32)
         while not self._listen_stop.is_set():
+            if self._speaking:                 # robot talking: drop mic + reset VAD
+                self._vad_iter.reset_states()
+                collecting, utt = False, []
+                pending = np.zeros(0, dtype=np.float32)
+                pre.clear()
+                time.sleep(0.02)
+                continue
             sample = self._mini.media.get_audio_sample()
-            if sample is not None and not self._speaking:
-                with self._listen_lock:
-                    self._listen_buffer.append(sample)
-            time.sleep(0.01)
+            if sample is None:
+                time.sleep(0.01)
+                continue
+            s = np.asarray(sample, dtype=np.float32)
+            s = s[:, 0] if s.ndim > 1 else s.reshape(-1)
+            pending = np.concatenate([pending, s])
+            while len(pending) >= WIN:
+                w = pending[:WIN]
+                pending = pending[WIN:]
+                try:
+                    res = self._vad_iter(w, return_seconds=False)
+                except Exception:  # noqa: BLE001
+                    res = None
+                if res and "start" in res:
+                    collecting = True
+                    utt = list(pre) + [w]
+                    pre.clear()
+                elif res and "end" in res:
+                    if collecting:
+                        utt.append(w)
+                        if len(utt) >= MIN_WINS:
+                            self._utterance_q.put(np.concatenate(utt))
+                    collecting, utt = False, []
+                elif collecting:
+                    utt.append(w)
+                    if len(utt) >= MAX_WINS:   # runaway cap
+                        self._utterance_q.put(np.concatenate(utt))
+                        collecting, utt = False, []
+                        self._vad_iter.reset_states()
+                else:
+                    pre.append(w)
+            time.sleep(0.003)
 
     # --- Motion ---
 

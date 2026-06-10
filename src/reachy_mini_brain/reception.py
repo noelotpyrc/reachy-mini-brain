@@ -87,8 +87,9 @@ class MockSession:
         log.info("mock session: listen_start")
         return "listening"
 
-    def listen_read(self):
+    def listen_read(self, timeout: float = 1.0):
         # Emit fake speech every 3rd read so the text path is visible.
+        time.sleep(min(timeout, 0.5))
         self._reads += 1
         if self._reads % 3 == 0:
             return {"text": "hello reachy", "buffer_duration": 2.0}
@@ -135,7 +136,8 @@ class ReceptionDaemon:
                  wave_message: str = "Hi there!",
                  conversation_opener: str = "Hi! How can I help?",
                  conv_idle_timeout: float = 45.0, conv_max_duration: float = 480.0,
-                 brain: bool = False, brain_model: str = "sonnet"):
+                 brain: bool = False, brain_model: str = "sonnet",
+                 brain_backend: str = "claude", save_turns: bool = False):
         self._session = session
         self._vision_interval = vision_interval
         self._voice_interval = voice_interval
@@ -151,6 +153,10 @@ class ReceptionDaemon:
         self._conversation_mode = False
         self._brain_enabled = brain
         self._brain_model = brain_model
+        self._brain_backend = brain_backend
+        self._save_turns = save_turns
+        self._turns_jsonl = None
+        self._turn_n = 0
         self._lock = threading.Lock()
 
         self._vision_thread: threading.Thread | None = None
@@ -438,9 +444,6 @@ class ReceptionDaemon:
         start_ts = last_heard = time.monotonic()
         try:
             while not stop.is_set():
-                stop.wait(self._voice_interval)
-                if stop.is_set():
-                    break
                 # Conversation auto-end: idle (talker silent) OR a hard max-duration cap.
                 # FIRST PASS: idle resets on ANY transcript, so background noise heard-as-text
                 # can hold it open — the max cap bounds that. Speaker-aware close (reset only
@@ -454,12 +457,13 @@ class ReceptionDaemon:
                         log.info("voice: conversation ended (max cap %.0fs)", now - start_ts)
                         break
                 try:
-                    res = self._session.listen_read()
-                    dur = res.get("buffer_duration", 0.0)
+                    # Blocks up to 1s for ONE complete VAD-endpointed utterance (not a
+                    # time-slice). The 1s timeout keeps the idle/max checks above responsive.
+                    res = self._session.listen_read(timeout=1.0)
                     text = res.get("text", "")
                     if not text:
-                        log.info("voice: %.1fs buffered (silence)", dur)
                         continue
+                    dur = res.get("buffer_duration", 0.0)
                     last_heard = time.monotonic()
                     log.info("voice: heard %.1fs: %r", dur, text)
                     if brain is not None:
@@ -471,6 +475,8 @@ class ReceptionDaemon:
                             reply = brain.respond(text)
                             log.info("voice: reply: %r", reply)
                             self._session.speak(reply)  # antennas auto-stop when voice starts
+                            if self._save_turns:
+                                self._save_turn(res.get("audio"), text, reply)
                         finally:
                             think_stop.set()
                 except Exception as e:  # noqa: BLE001
@@ -485,6 +491,12 @@ class ReceptionDaemon:
 
     def _make_brain(self):
         try:
+            if self._brain_backend == "pydantic":
+                from reachy_mini_brain.brain import PydanticBrain
+
+                brain = PydanticBrain()
+                log.info("voice: loading brain (pydantic-ai/openrouter, model=%s)", brain.model)
+                return brain
             from reachy_mini_brain.brain import ReceptionBrain
 
             log.info("voice: loading brain (claude -p, model=%s)", self._brain_model)
@@ -492,6 +504,29 @@ class ReceptionDaemon:
         except Exception as e:  # noqa: BLE001
             log.warning("voice: brain unavailable (%s) — transcript-log only", e)
             return None
+
+    def _save_turn(self, audio, heard: str, reply: str) -> None:
+        """Debug capture (--save-turns): save each turn's utterance WAV + the heard STT text
+        and the brain reply, so off replies can be attributed to STT vs brain (listen to the
+        wav, compare to `heard`). Records to artifacts/turns/turns-<ts>.jsonl + per-turn wavs."""
+        if audio is None:
+            return
+        try:
+            import soundfile as sf
+
+            d = ARTIFACTS / "turns"
+            d.mkdir(parents=True, exist_ok=True)
+            if self._turns_jsonl is None:
+                self._turns_jsonl = d / f"turns-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+            self._turn_n += 1
+            wav = d / f"turn-{time.strftime('%H%M%S')}-{self._turn_n:03d}.wav"
+            sf.write(str(wav), audio, 16000)
+            rec = {"ts": time.time(), "n": self._turn_n, "dur": round(len(audio) / 16000.0, 2),
+                   "heard": heard, "reply": reply, "wav": wav.name}
+            with open(self._turns_jsonl, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception as e:  # noqa: BLE001
+            log.warning("save_turn error %s", e)
 
     # --- status ---
 
@@ -638,7 +673,8 @@ def _handle(daemon: ReceptionDaemon, conn: socket.socket) -> bool:
 def serve_daemon(mock: bool, vision_interval: float, voice_interval: float,
                  perception: bool = False, threshold: float = 0.5,
                  gestures: bool = False,
-                 brain: bool = False, brain_model: str = "sonnet"):
+                 brain: bool = False, brain_model: str = "sonnet",
+                 brain_backend: str = "claude", save_turns: bool = False):
     """Start the reception daemon + control socket (blocks until shutdown)."""
     if mock:
         session = MockSession()
@@ -651,7 +687,8 @@ def serve_daemon(mock: bool, vision_interval: float, voice_interval: float,
     daemon = ReceptionDaemon(
         session, vision_interval=vision_interval, voice_interval=voice_interval,
         perception=perception, threshold=threshold, gestures=gestures,
-        brain=brain, brain_model=brain_model,
+        brain=brain, brain_model=brain_model, brain_backend=brain_backend,
+        save_turns=save_turns,
     )
 
     log.info("starting session%s...", " (mock)" if mock else "")
@@ -757,8 +794,14 @@ def cli():
               help="Also run MediaPipe wave detection (Open_Palm) in the vision worker.")
 @click.option("--brain/--no-brain", default=False,
               help="Route heard speech to the claude -p receptionist brain and speak the reply.")
-@click.option("--brain-model", default="sonnet", help="Brain model (e.g. sonnet, haiku, opus).")
-def serve(mock, vision_interval, voice_interval, perception, threshold, gestures, brain, brain_model):
+@click.option("--brain-model", default="sonnet", help="claude backend model (sonnet/haiku/opus).")
+@click.option("--brain-backend", type=click.Choice(["claude", "pydantic"]), default="claude",
+              help="Brain backend: claude -p (default) or pydantic-ai over OpenRouter.")
+@click.option("--save-turns/--no-save-turns", default=False,
+              help="Debug: save each turn's utterance WAV + heard/reply to artifacts/turns/ "
+                   "(to attribute off replies to STT vs brain).")
+def serve(mock, vision_interval, voice_interval, perception, threshold, gestures, brain,
+          brain_model, brain_backend, save_turns):
     """Run the reception daemon (blocks until `shutdown` or Ctrl-C)."""
     # Durable log: the daemon owns a timestamped file under artifacts/logs/ (never /tmp,
     # which the OS cleans), in addition to stderr. Survives restarts; never overwritten.
@@ -772,7 +815,7 @@ def serve(mock, vision_interval, voice_interval, perception, threshold, gestures
     )
     log.info("durable log -> %s", logfile)
     serve_daemon(mock, vision_interval, voice_interval, perception, threshold,
-                 gestures, brain, brain_model)
+                 gestures, brain, brain_model, brain_backend, save_turns)
 
 
 @cli.command()

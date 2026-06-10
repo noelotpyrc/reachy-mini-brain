@@ -171,3 +171,78 @@ class ReceptionBrain:
             return persona
         return (f"{persona}\n\n--- AUTHORITATIVE CLINIC FACTS "
                 f"(use exactly; never invent) ---\n{facts}")
+
+
+# --- Alternative backend: in-process Pydantic AI over OpenRouter -------------------
+# `claude -p` (above) is the first-pass stopgap (single-provider, needs the tmux/keychain auth
+# hack, per-turn process). PydanticBrain is the chosen next iteration: in-process (no spawn),
+# multi-provider via OpenRouter (swap models with one string), ~0.6s/turn in benchmarks. DSPy is
+# the long-term path (prompt optimization). See docs/brain-backend-research.md.
+
+_DEFAULT_OR_MODEL = os.environ.get("REACHY_BRAIN_MODEL", "openai/gpt-oss-20b")
+
+
+def _openrouter_key() -> str:
+    """OpenRouter key from env, falling back to the project `.env` (the daemon often launches
+    without it exported)."""
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if key:
+        return key
+    env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    try:
+        for raw in open(env_path, encoding="utf-8"):
+            if raw.startswith("OPENROUTER_API_KEY="):
+                return raw.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    raise RuntimeError("OPENROUTER_API_KEY not set (export it or put it in the project .env)")
+
+
+class PydanticBrain:
+    """Receptionist brain over Pydantic AI + OpenRouter — in-process, multi-provider.
+
+    Same interface as ``ReceptionBrain`` (``respond``/``prewarm``/``reset``) so the daemon can
+    swap backends. Conversation memory is the in-process ``message_history``; an idle gap longer
+    than ``conversation_timeout`` (or an explicit ``reset()``) ends the conversation so the next
+    visitor starts fresh. No per-turn process spawn and no keychain/tmux hack — just an API call.
+    """
+
+    def __init__(self, model: str = _DEFAULT_OR_MODEL, persona: str = PERSONA,
+                 facts_path: str = _FACTS_PATH, api_key: str | None = None,
+                 conversation_timeout: float = 120.0):
+        self.model = model
+        self.persona = ReceptionBrain._with_facts(persona, facts_path)
+        self.conversation_timeout = conversation_timeout
+        self._api_key = api_key or _openrouter_key()
+        self._agent = None
+        self._history: list = []
+        self._last_ts: float | None = None
+
+    def _build(self) -> None:
+        from pydantic_ai import Agent
+        from pydantic_ai.models.openai import OpenAIChatModel
+        from pydantic_ai.providers.openrouter import OpenRouterProvider
+        model = OpenAIChatModel(self.model, provider=OpenRouterProvider(api_key=self._api_key))
+        self._agent = Agent(model, instructions=self.persona)
+
+    def prewarm(self) -> None:
+        """Construct the agent now (just import+build, no process) so the first turn isn't slowed."""
+        if self._agent is None:
+            self._build()
+
+    def respond(self, utterance: str, timeout: float | None = None) -> str:
+        now = time.monotonic()
+        if self._last_ts is not None and now - self._last_ts > self.conversation_timeout:
+            self.reset()  # idle gap -> new visitor / new conversation
+        self._last_ts = now
+        if self._agent is None:
+            self._build()
+        settings = {"timeout": timeout} if timeout else None
+        r = self._agent.run_sync(utterance, message_history=self._history, model_settings=settings)
+        self._history = r.all_messages()
+        return (r.output or "").strip()
+
+    def reset(self) -> None:
+        """End the conversation — clear in-process history (next turn starts fresh)."""
+        self._history = []
+        self._last_ts = None
