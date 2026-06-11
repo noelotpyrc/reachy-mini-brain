@@ -17,9 +17,9 @@ audio = [
     "soundfile",
     "scipy",
     "pathvalidate",
+    "silero-vad",
 ]
-# Reception vision pipeline (Phase B). The voice brain (Phase C) shells out to the
-# `claude` CLI, so it needs no Python dependency here.
+# Reception vision pipeline (Phase B).
 vision = [
     "rfdetr",
     "supervision",
@@ -30,11 +30,16 @@ vision = [
 gesture = [
     "mediapipe",
 ]
+# Pydantic-AI/OpenRouter brain backend for the reception daemon.
+brain = [
+    "pydantic-ai-slim[openai]",
+]
 sim = ["reachy-mini[mujoco]"]
 dev = ["pytest", "ruff"]
 
 [project.scripts]
 reception = "reachy_mini_brain.reception:cli"
+review-audio = "reachy_mini_brain.review_audio:cli"
 
 [build-system]
 requires = ["hatchling"]

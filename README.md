@@ -7,6 +7,7 @@ Claude Code as the brain for a [Reachy Mini](https://www.pollen-robotics.com/rea
 ```bash
 uv venv && uv pip install -e .
 uv pip install -e ".[audio]"   # for listen/speak commands
+uv pip install -e ".[audio,vision,gesture,brain]"  # full reception stack
 ```
 
 ## Structure
@@ -29,8 +30,9 @@ src/reachy_mini_brain/
 ├── perception.py    # detect → track → approach (+ gestures) → events.jsonl
 ├── gesture.py       # MediaPipe wave detection (Open_Palm) — Feature 2
 ├── replay.py        # offline eval harness: replay clips (--annotate, --smooth, --expect)
+├── review_audio.py  # offline audio review: sync run, align turns, generate clips/index
 ├── alert_engine.py  # separate process: tails events → robot reacts (approach/depart/wave)
-└── brain.py         # claude -p receptionist agent (voice brain)
+└── brain.py         # claude -p / Pydantic-AI receptionist agent (voice brain)
 ```
 
 ## Usage
@@ -65,8 +67,12 @@ src/reachy_mini_brain/
 .venv/bin/python -m reachy_mini_brain.reception vision on
 .venv/bin/python -m reachy_mini_brain.reception voice on
 .venv/bin/python -m reachy_mini_brain.reception status
+.venv/bin/python -m reachy_mini_brain.reception audio-record on
 # Alert engine (separate process): approach → robot greets
 .venv/bin/python -m reachy_mini_brain.alert_engine
+
+# Offline audio review for a recorded run
+.venv/bin/python -m reachy_mini_brain.review_audio 20260610-141813-89a059 --clips flagged
 ```
 
 See `docs/robot-guide.md` for the full CLI reference.

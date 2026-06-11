@@ -10,6 +10,59 @@ Each entry uses three buckets:
 
 ---
 
+## 2026-06-10 — live daemon sessions; raw-audio review diagnosed next day (2026-06-11)
+
+**Setup:** m1max + real robot. Two useful recorded daemon sessions were inspected offline on
+2026-06-11 with the new `review_audio` utility:
+
+- `20260610-141813-89a059` — Pydantic/OpenRouter brain using `openai/gpt-oss-20b`; voice was
+  manually turned on as always-on (`conversation=False`) while perception/gestures/record/capture/
+  raw-audio were also running.
+- `20260610-145250-1a7624` — `claude -p --model haiku`; wave→conversation style session, voice
+  mostly off outside conversation windows; same raw-audio/video/capture/turn artifacts enabled.
+
+### 🟢 Good
+- **Raw audio + turn review harness is now actionable.** The run artifacts synced locally and the
+  review utility generated `review.md`/`review.csv`/`review.json` plus exact-turn/context/wide WAVs
+  under `artifacts/reviews/<run_id>/`. This made it possible to separate raw mic quality, VAD/queue
+  timing, STT quality, and brain behavior instead of relying only on live impressions.
+- **The Haiku/wave-chat run has healthy raw mic continuity.** `145250` recorded 959.38s of audio over
+  965.32s wall time (audio/wall ≈ 0.994), median chunk gap 20ms, and only 28 gaps over 100ms. User
+  review: the clips are much clearer and do **not** show the choppy-audio problem seen in the first
+  run.
+
+### 🟡 Ugly
+- **STT is still not reliable enough even with clear input.** In the clearer Haiku run, user review
+  flagged omissions/mistranscriptions around turns 05/06/13, and turns 03/04 split one realistic
+  human turn into two separate VAD/STT turns. Cleaner audio helps a lot, but faster-whisper/VAD
+  still need tuning or replacement for receptionist UX.
+- **Turn timestamps are not UX timestamps.** `turns-*.jsonl` writes after brain response / robot
+  speech, so it can lag the actual user utterance by ~10–40s. The review utility now signal-matches
+  turn WAVs back into the continuous raw WAV to recover the real audio timing.
+
+### 🔴 Bad / diagnosis
+- **First recorded session's raw mic audio is choppy / time-compressed relative to wall time.**
+  In `141813`, the WAV contains 1301.98s of audio over 1721.53s wall time (audio/wall ≈ 0.756):
+  about 419.5s of live time is not represented by recorded samples. Median chunk gap was 27ms for
+  20ms chunks, with 1109 gaps over 100ms. User review of the clips matched the live UX: choppy sound
+  and nonsensical STT (`heard` text not close to what was said).
+- **Working hypothesis, not proven root cause:** the bad first session is consistent with audio I/O
+  starvation or WebRTC mic-delivery stalls under single-process load. That run had always-on voice
+  plus perception/MediaPipe, raw recording, video/capture, STT, brain calls, and TTS playback active
+  continuously. The clearer Haiku run was more gated: voice mostly ran only during wave-triggered
+  conversation windows, and vision pauses while the robot is speaking. This points toward resource
+  contention as a plausible cause of both choppy input recordings and choppy robot output, but it
+  still needs a controlled A/B before being treated as settled.
+
+### Next
+- Treat audio I/O as high priority: isolate mic capture/playback from RF-DETR/STT/brain/TTS work
+  (separate process or tighter queues).
+- Add queue-age guards so stale utterances are dropped rather than answered late.
+- Add VAD merge logic for adjacent utterances separated by very short gaps.
+- Re-test STT alternatives/tuning on the clearer Haiku clips, not on the corrupted/choppy first run.
+
+---
+
 ## 2026-06-09 — head recalibration; pydantic brain live; streaming-TTS rejected; VAD endpointing FIXES the STT garble; turn-capture for debug
 
 **Setup:** m1max daemon, many restart cycles. Robot recalibrated mid-session via the Reachy app.

@@ -127,14 +127,18 @@ brain mostly reacts correctly to bad text, so **STT is the bottleneck.**
 |---|---|---|---|---|
 | **Parakeet-TDT via `parakeet-mlx`** | local, M-series (MLX) | **~80ms** | strong | NVIDIA Parakeet on Apple Silicon; ~1h audio in ~53s; streaming. **Biggest local win.** (Also FluidAudio → CoreML/Neural Engine.) |
 | **Moonshine v2** | local (ONNX/torch) | ~107ms | 6.65% (> Whisper L-v3) | purpose-built for **real-time short utterances**, tiny (27–245MB), low hallucination. Mac support less mature than Parakeet. |
+| **whisper-large-v3** | local (faster-whisper) | slower/heavier than turbo | strong | **Drop-in quality ceiling** for the current faster-whisper stack; use as the accuracy comparison against turbo on our clean robot clips. |
 | **whisper-large-v3-turbo** | local (faster-whisper) | ~6× faster than L-v3 | ~6.7% | **drop-in** one-line model swap for our faster-whisper; still batch; easiest test. |
 | **Voxtral (Mistral)** | local | streaming | **5.9%** (best OSS) | 4B, Apache-2.0, native streaming; bigger. |
 | **AssemblyAI Universal-Streaming** | cloud | ~150ms P50 (post-VAD) | top; **73% fewer noise false-outputs** vs Deepgram Nova-2 | intelligent endpointing (acoustic+semantic) → could replace our Silero VAD; noise-robust. |
 | **Deepgram Nova-3 / Flux** | cloud | 150–300ms | 5.26% | Flux = lowest end-of-speech latency; Voice-Agent API bundles STT/TTS/LLM. |
 
 ### Recommendation
-1. **Quick test (no new deps):** swap faster-whisper `medium → large-v3-turbo` — faster + more accurate
-   than medium in one line; sets the easy ceiling.
+1. **Quick test (no new deps):** offline A/B faster-whisper `medium` vs `large-v3` vs
+   `large-v3-turbo` on the clean Haiku review clips (`20260610-145250-1a7624`), especially
+   the known failure points: 03/04 split one human turn; 05/06/13 have omissions or
+   mistranscriptions. Use `large-v3` as the quality ceiling and `large-v3-turbo` as the likely
+   latency/quality trade-off. Do not use the choppy GPT-OSS run as an STT-quality benchmark.
 2. **The real upgrade (local):** **`parakeet-mlx`** — ~80ms on m1max (vs our ~2s), accurate, private, no
    cloud. Strongest fit for a local fast receptionist STT. (Moonshine is the short-utterance specialist
    alternative if Parakeet underwhelms on our audio.)

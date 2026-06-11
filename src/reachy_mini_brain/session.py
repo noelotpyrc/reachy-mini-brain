@@ -55,6 +55,19 @@ class Session:
         self._push_lock = threading.Lock()
         self._speaking = False  # True during speak(); mic listener + vision pause on it
         self._speech_cache: dict = {}  # rendered audio for fixed lines (speak(cache=True))
+        self._listen_thread: threading.Thread | None = None
+        self._listen_stop: threading.Event | None = None
+        self._listen_vad_enabled = False
+        self._raw_audio_lock = threading.Lock()
+        self._raw_audio_recording = False
+        self._raw_audio_file = None
+        self._raw_audio_meta = None
+        self._raw_audio_path: Path | None = None
+        self._raw_audio_meta_path: Path | None = None
+        self._raw_audio_run_id: str | None = None
+        self._raw_audio_started_ts: float | None = None
+        self._raw_audio_samples = 0
+        self._raw_audio_chunks = 0
 
     # --- Lifecycle ---
 
@@ -89,11 +102,15 @@ class Session:
         """Graceful shutdown — close media pipelines and disconnect."""
         if self._mini is None:
             return
-        # Stop listener thread if running
-        if hasattr(self, "_listen_stop"):
-            self._listen_stop.set()
-            if hasattr(self, "_listen_thread"):
-                self._listen_thread.join(timeout=5)
+        # Stop recording/listening before tearing down the media pipeline.
+        try:
+            self.audio_record_stop()
+        except Exception:
+            pass
+        try:
+            self.listen_stop()
+        except Exception:
+            pass
         try:
             self._mini.media_manager.close()
         except Exception:
@@ -112,6 +129,8 @@ class Session:
             "connected": self.is_connected,
             "audio_ready": self.is_audio_ready,
             "video_ready": self._mini is not None and self._mini.media.get_frame() is not None,
+            "audio_recording": self._raw_audio_recording,
+            "audio_record_path": str(self._raw_audio_path) if self._raw_audio_recording else None,
         }
 
     def __enter__(self):
@@ -238,10 +257,9 @@ class Session:
         return audio
 
     def _play_speech(self, audio) -> None:
-        # Pause the mic listener AND the vision worker for the whole playback — both
-        # contend with the audio push thread, and vision (RF-DETR) contention is what
-        # makes speech choppy. try/finally so a push error can't leave it stuck paused.
-        # (First-pass: the proper fix is to run perception in its own OS process.)
+        # Flag playback so VAD ignores the robot's own voice and the vision worker
+        # pauses RF-DETR; vision contention is what makes speech choppy. try/finally
+        # so a push error can't leave the system stuck in speaking mode.
         self._speaking = True
         try:
             # Feed the speaker with a primed cushion, then at real-time. Two failure
@@ -268,6 +286,119 @@ class Session:
         speech cache so the first opener/greet/goodbye has no synth latency (cuts startup lag)."""
         self._render_speech(text, voice, cache=True)
 
+    # --- Raw audio recording ---
+
+    def audio_record_start(self, path: str | None = None, run_id: str | None = None) -> dict:
+        """Start recording Cat-1 mic audio.
+
+        Writes a 16 kHz mono float WAV plus a JSONL sidecar with wall-clock timestamps
+        and sample offsets. The same mic loop also feeds VAD when listen_start() is
+        active, so recording does not create a competing WebRTC audio reader.
+        """
+        self._check()
+        with self._raw_audio_lock:
+            if self._raw_audio_recording:
+                return self._raw_audio_summary(running=True)
+
+            if path is None:
+                _ARTIFACTS_DIR.mkdir(exist_ok=True)
+                path_obj = _ARTIFACTS_DIR / f"audio-{time.strftime('%H%M%S')}.wav"
+            else:
+                path_obj = Path(path)
+                path_obj.parent.mkdir(parents=True, exist_ok=True)
+            meta_path = path_obj.with_suffix(".jsonl")
+
+            import soundfile as sf
+
+            self._raw_audio_file = sf.SoundFile(
+                str(path_obj), mode="w", samplerate=16000, channels=1, subtype="FLOAT"
+            )
+            self._raw_audio_meta = meta_path.open("w", encoding="utf-8")
+            self._raw_audio_path = path_obj
+            self._raw_audio_meta_path = meta_path
+            self._raw_audio_run_id = run_id
+            self._raw_audio_started_ts = time.time()
+            self._raw_audio_samples = 0
+            self._raw_audio_chunks = 0
+            self._raw_audio_recording = True
+            self._raw_audio_meta.write(json.dumps({
+                "type": "start",
+                "ts": round(self._raw_audio_started_ts, 3),
+                "sample_rate": 16000,
+                "channels": 1,
+                "format": "wav-float32",
+                "path": str(path_obj),
+                "run_id": run_id,
+            }) + "\n")
+            self._raw_audio_meta.flush()
+
+        self._ensure_listen_thread()
+        return self._raw_audio_summary(running=True)
+
+    def audio_record_stop(self) -> dict:
+        """Stop Cat-1 mic recording and close the WAV/sidecar."""
+        with self._raw_audio_lock:
+            if not self._raw_audio_recording:
+                return self._raw_audio_summary(running=False)
+
+            summary = self._raw_audio_summary(running=False)
+            if self._raw_audio_meta is not None:
+                self._raw_audio_meta.write(json.dumps({
+                    "type": "stop",
+                    "ts": round(time.time(), 3),
+                    "run_id": self._raw_audio_run_id,
+                    "sample_end": self._raw_audio_samples,
+                    "duration": round(self._raw_audio_samples / 16000.0, 2),
+                }) + "\n")
+                self._raw_audio_meta.close()
+            if self._raw_audio_file is not None:
+                self._raw_audio_file.close()
+
+            self._raw_audio_recording = False
+            self._raw_audio_file = None
+            self._raw_audio_meta = None
+
+        if not self._listen_vad_enabled:
+            self._stop_listen_thread()
+        return summary
+
+    def _raw_audio_summary(self, running: bool) -> dict:
+        return {
+            "recording": running,
+            "path": str(self._raw_audio_path) if self._raw_audio_path else None,
+            "metadata": str(self._raw_audio_meta_path) if self._raw_audio_meta_path else None,
+            "samples": self._raw_audio_samples,
+            "duration": round(self._raw_audio_samples / 16000.0, 2),
+            "chunks": self._raw_audio_chunks,
+            "run_id": self._raw_audio_run_id,
+        }
+
+    def _write_raw_audio(self, sample, *, speaking: bool) -> None:
+        """Append one mic sample chunk to the raw-audio WAV and timestamp sidecar."""
+        if not self._raw_audio_recording:
+            return
+        audio = np.asarray(sample, dtype=np.float32)
+        audio = audio[:, 0] if audio.ndim > 1 else audio.reshape(-1)
+        with self._raw_audio_lock:
+            if not self._raw_audio_recording or self._raw_audio_file is None:
+                return
+            sample_start = self._raw_audio_samples
+            self._raw_audio_file.write(audio)
+            self._raw_audio_samples += len(audio)
+            self._raw_audio_chunks += 1
+            if self._raw_audio_meta is not None:
+                rec = {
+                    "type": "chunk",
+                    "ts": round(time.time(), 3),
+                    "run_id": self._raw_audio_run_id,
+                    "sample_start": sample_start,
+                    "samples": int(len(audio)),
+                    "speaking": bool(speaking),
+                    "rms": round(float(np.sqrt(np.mean(audio**2))) if len(audio) else 0.0, 5),
+                }
+                self._raw_audio_meta.write(json.dumps(rec) + "\n")
+                self._raw_audio_meta.flush()
+
     # --- Continuous listening ---
 
     def listen_start(self, model: str = "medium", language: str = "en") -> str:
@@ -279,22 +410,20 @@ class Session:
         to pull + transcribe the next complete utterance.
         """
         self._check()
-        if hasattr(self, "_listen_thread") and self._listen_thread.is_alive():
+        if self._listen_vad_enabled:
             return "already listening"
 
-        self._listen_stop = threading.Event()
         self._utterance_q: queue.Queue = queue.Queue()
         self._listen_model = model
         self._listen_language = language
-        self._speaking = False  # set by speak() to flag own-voice audio
         from silero_vad import load_silero_vad, VADIterator
 
         self._vad_iter = VADIterator(
             load_silero_vad(onnx=True), sampling_rate=16000,
             threshold=0.5, min_silence_duration_ms=700,
         )
-        self._listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self._listen_thread.start()
+        self._listen_vad_enabled = True
+        self._ensure_listen_thread()
         return "listening"
 
     def listen_read(self, timeout: float = 1.0) -> dict:
@@ -322,19 +451,36 @@ class Session:
 
     def listen_stop(self) -> str:
         """Stop continuous background listening."""
-        if hasattr(self, "_listen_stop"):
-            self._listen_stop.set()
-            if hasattr(self, "_listen_thread"):
-                self._listen_thread.join(timeout=10)
+        self._listen_vad_enabled = False
+        if not self._raw_audio_recording:
+            self._stop_listen_thread()
         return "stopped"
 
+    def _ensure_listen_thread(self) -> None:
+        """Start the shared mic loop if it is not already running."""
+        if self._listen_thread is not None and self._listen_thread.is_alive():
+            return
+        self._listen_stop = threading.Event()
+        self._listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._listen_thread.start()
+
+    def _stop_listen_thread(self) -> None:
+        """Stop the shared mic loop when neither VAD nor raw recording needs it."""
+        if self._listen_stop is not None:
+            self._listen_stop.set()
+        if self._listen_thread is not None:
+            self._listen_thread.join(timeout=10)
+        self._listen_thread = None
+        self._listen_stop = None
+
     def _listen_loop(self) -> None:
-        """Background thread: Silero-VAD endpointer.
+        """Background thread: raw mic fanout + optional Silero-VAD endpointer.
 
         Feeds the mic stream to VADIterator in 512-sample (32ms) windows, collects audio
         from speech-start to speech-end (with a short pre-roll so onsets aren't clipped),
-        and puts each COMPLETE utterance on _utterance_q. Pauses + resets while the robot
-        speaks (no self-hearing). A max-length cap bounds a never-ending utterance.
+        and puts each COMPLETE utterance on _utterance_q. Raw recording sees the mic
+        chunks before VAD/STT interpretation and records robot-speaking chunks with a
+        metadata flag. VAD still resets while the robot speaks (no self-hearing).
         """
         WIN = 512                              # Silero window @ 16kHz
         PREROLL = 8                            # ~256ms kept before speech start
@@ -344,18 +490,31 @@ class Session:
         utt: list = []
         collecting = False
         pending = np.zeros(0, dtype=np.float32)
-        while not self._listen_stop.is_set():
-            if self._speaking:                 # robot talking: drop mic + reset VAD
-                self._vad_iter.reset_states()
+        while self._listen_stop is not None and not self._listen_stop.is_set():
+            sample = self._mini.media.get_audio_sample()
+            if sample is None:
+                time.sleep(0.01)
+                continue
+
+            speaking = bool(self._speaking)
+            self._write_raw_audio(sample, speaking=speaking)
+
+            if speaking:                       # robot talking: reset VAD state
+                if self._listen_vad_enabled:
+                    self._vad_iter.reset_states()
                 collecting, utt = False, []
                 pending = np.zeros(0, dtype=np.float32)
                 pre.clear()
                 time.sleep(0.02)
                 continue
-            sample = self._mini.media.get_audio_sample()
-            if sample is None:
-                time.sleep(0.01)
+
+            if not self._listen_vad_enabled:
+                collecting, utt = False, []
+                pending = np.zeros(0, dtype=np.float32)
+                pre.clear()
+                time.sleep(0.003)
                 continue
+
             s = np.asarray(sample, dtype=np.float32)
             s = s[:, 0] if s.ndim > 1 else s.reshape(-1)
             pending = np.concatenate([pending, s])
@@ -476,6 +635,7 @@ _REMOTE_METHODS = {
     "speak", "listen", "nod", "shake", "look", "take_photo",
     "move_head", "rotate_body", "antennas", "get_state", "status",
     "listen_start", "listen_read", "listen_stop",
+    "audio_record_start", "audio_record_stop",
 }
 
 # Aliases for convenience

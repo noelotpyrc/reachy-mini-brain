@@ -38,6 +38,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import click
@@ -67,6 +68,9 @@ class MockSession:
 
     def __init__(self):
         self._reads = 0
+        self._audio_record_path = "artifacts/audio-mock.wav"
+        self._audio_record_meta = "artifacts/audio-mock.jsonl"
+        self._audio_record_run_id = None
 
     # lifecycle
     def start(self):
@@ -99,9 +103,40 @@ class MockSession:
         log.info("mock session: listen_stop")
         return "stopped"
 
+    def audio_record_start(self, path=None, run_id=None):
+        log.info("mock session: audio_record_start")
+        if path:
+            self._audio_record_path = path
+            self._audio_record_meta = str(Path(path).with_suffix(".jsonl"))
+        self._audio_record_run_id = run_id
+        return {
+            "recording": True,
+            "path": self._audio_record_path,
+            "metadata": self._audio_record_meta,
+            "samples": 0,
+            "duration": 0.0,
+            "chunks": 0,
+            "run_id": self._audio_record_run_id,
+        }
+
+    def audio_record_stop(self):
+        log.info("mock session: audio_record_stop")
+        return {
+            "recording": False,
+            "path": self._audio_record_path,
+            "metadata": self._audio_record_meta,
+            "samples": 0,
+            "duration": 0.0,
+            "chunks": 0,
+            "run_id": self._audio_record_run_id,
+        }
+
     # react actions (greeting)
     def speak(self, text, voice="en_US-lessac-medium"):
         log.info("mock session: speak %r", text)
+
+    def prerender(self, text, voice="en_US-lessac-medium"):
+        log.info("mock session: prerender %r", text)
 
     def look(self, direction):
         log.info("mock session: look %s", direction)
@@ -137,7 +172,10 @@ class ReceptionDaemon:
                  conversation_opener: str = "Hi! How can I help?",
                  conv_idle_timeout: float = 45.0, conv_max_duration: float = 480.0,
                  brain: bool = False, brain_model: str = "sonnet",
-                 brain_backend: str = "claude", save_turns: bool = False):
+                 brain_backend: str = "claude", save_turns: bool = False,
+                 run_id: str | None = None, log_path: Path | None = None):
+        self._run_id = run_id or f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        self._log_path = Path(log_path) if log_path else None
         self._session = session
         self._vision_interval = vision_interval
         self._voice_interval = voice_interval
@@ -152,12 +190,46 @@ class ReceptionDaemon:
         self._conv_max_duration = conv_max_duration
         self._conversation_mode = False
         self._brain_enabled = brain
-        self._brain_model = brain_model
         self._brain_backend = brain_backend
+        self._brain_model_requested = brain_model
+        self._brain_model = self._resolve_brain_model(brain_backend, brain_model)
         self._save_turns = save_turns
         self._turns_jsonl = None
+        self._turns_manifest_idx: int | None = None
         self._turn_n = 0
         self._lock = threading.Lock()
+        self._manifest_lock = threading.Lock()
+        self._artifact_counts: dict[str, int] = {}
+        self._manifest_path = ARTIFACTS / "runs" / f"run-{self._run_id}.json"
+        self._manifest = {
+            "run_id": self._run_id,
+            "started_ts": round(time.time(), 3),
+            "pid": os.getpid(),
+            "config": {
+                "vision_interval": self._vision_interval,
+                "voice_interval": self._voice_interval,
+                "perception": self._perception_enabled,
+                "threshold": self._threshold,
+                "gestures": self._gestures,
+                "brain": self._brain_enabled,
+                "brain_model": self._brain_model,
+                "brain_model_requested": self._brain_model_requested,
+                "brain_backend": self._brain_backend,
+                "save_turns": self._save_turns,
+            },
+            "artifacts": {
+                "log": ([{"path": str(self._log_path)}] if self._log_path else []),
+                "events": [{
+                    "path": str(ARTIFACTS / "events.jsonl"),
+                    "run_id_field": True,
+                    "mode": "append",
+                }],
+                "video": [],
+                "capture": [],
+                "audio": [],
+                "turns": [],
+            },
+        }
 
         self._vision_thread: threading.Thread | None = None
         self._vision_stop: threading.Event | None = None
@@ -169,21 +241,85 @@ class ReceptionDaemon:
         self._capture_path: Path | None = None
         self._capture_frames = 0
         self._capture_events = 0
+        self._capture_manifest_idx: int | None = None
 
         # video recording (persist the camera frames the vision worker grabs)
         self._recording = False
         self._record_path: Path | None = None
         self._record_writer = None
         self._record_frames = 0
+        self._record_manifest_idx: int | None = None
+
+        # raw audio recording (Cat-1 mic signal, owned by Session)
+        self._audio_record_manifest_idx: int | None = None
 
         # live MJPEG stream of the vision worker's frames (view via an ssh tunnel)
         self._streaming = False
         self._latest_frame = None
         self._stream_server = None
 
+        self._write_manifest()
+
+    # --- run manifest ---
+
+    @staticmethod
+    def _resolve_brain_model(backend: str, requested: str) -> str:
+        """Return the actual model used by the selected brain backend."""
+        if backend == "pydantic":
+            from reachy_mini_brain.brain import default_openrouter_model
+
+            return default_openrouter_model()
+        return requested
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    @property
+    def manifest_path(self) -> Path:
+        return self._manifest_path
+
+    def _artifact_path(self, kind: str, suffix: str, *, directory: Path | None = None) -> Path:
+        """Return a per-run artifact path with a stable counter: kind-run_id-01.ext."""
+        self._artifact_counts[kind] = self._artifact_counts.get(kind, 0) + 1
+        root = directory or ARTIFACTS
+        root.mkdir(parents=True, exist_ok=True)
+        return root / f"{kind}-{self._run_id}-{self._artifact_counts[kind]:02d}{suffix}"
+
+    def _write_manifest(self) -> None:
+        """Persist the manifest; callers hold no lock so this can be used from workers."""
+        with self._manifest_lock:
+            self._manifest["updated_ts"] = round(time.time(), 3)
+            self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._manifest_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._manifest, indent=2, sort_keys=True) + "\n",
+                           encoding="utf-8")
+            tmp.replace(self._manifest_path)
+
+    def _manifest_add_artifact(self, kind: str, **fields) -> int:
+        with self._manifest_lock:
+            items = self._manifest["artifacts"].setdefault(kind, [])
+            rec = {"started_ts": round(time.time(), 3), **fields}
+            items.append(rec)
+            idx = len(items) - 1
+        self._write_manifest()
+        return idx
+
+    def _manifest_update_artifact(self, kind: str, idx: int | None, **fields) -> None:
+        if idx is None:
+            return
+        with self._manifest_lock:
+            items = self._manifest["artifacts"].setdefault(kind, [])
+            if idx >= len(items):
+                return
+            items[idx].update(fields)
+            items[idx]["updated_ts"] = round(time.time(), 3)
+        self._write_manifest()
+
     # --- lifecycle ---
 
     def start(self):
+        log.info("run_id=%s manifest -> %s", self._run_id, self._manifest_path)
         self._session.start()
         # Warm the speech cache for the fixed lines so the first opener/greet/goodbye/wave has
         # no synthesis latency — cuts the wave->reaction startup lag.
@@ -200,9 +336,16 @@ class ReceptionDaemon:
         release the VideoWriter, or the mp4 is left unfinalized and unreadable."""
         self.vision_off()
         self.voice_off()
+        self.audio_record_off()
         self.record_off()
         self.capture_off()
+        self._manifest_update_artifact(
+            "turns", self._turns_manifest_idx, status="closed",
+            ended_ts=round(time.time(), 3), turns=self._turn_n,
+        )
         self._session.stop()
+        self._manifest["ended_ts"] = round(time.time(), 3)
+        self._write_manifest()
 
     # --- vision toggle ---
 
@@ -267,7 +410,11 @@ class ReceptionDaemon:
             from reachy_mini_brain.perception import PerceptionPipeline
 
             log.info("vision: loading perception (RF-DETR)...")
-            p = PerceptionPipeline(threshold=self._threshold, gestures=self._gestures)
+            p = PerceptionPipeline(
+                threshold=self._threshold,
+                gestures=self._gestures,
+                run_id=self._run_id,
+            )
             log.info("vision: perception ready")
             return p
         except Exception as e:  # noqa: BLE001
@@ -279,12 +426,15 @@ class ReceptionDaemon:
     def capture_on(self) -> str:
         """Start recording every vision frame's tracks/decisions to a fresh file."""
         with self._lock:
-            self._capture_path = ARTIFACTS / f"capture-{time.strftime('%H%M%S')}.jsonl"
+            self._capture_path = self._artifact_path("capture", ".jsonl")
             self._capture_path.parent.mkdir(parents=True, exist_ok=True)
             self._capture_path.write_text("")
             self._capture_frames = 0
             self._capture_events = 0
             self._capturing = True
+            self._capture_manifest_idx = self._manifest_add_artifact(
+                "capture", path=str(self._capture_path), status="open"
+            )
         log.info("capture: started -> %s", self._capture_path)
         return f"capturing -> {self._capture_path}"
 
@@ -299,10 +449,22 @@ class ReceptionDaemon:
             }
         log.info("capture: stopped (%s frames, %s events)",
                  summary["frames"], summary["events"])
+        self._manifest_update_artifact(
+            "capture", self._capture_manifest_idx, status="closed",
+            ended_ts=round(time.time(), 3), frames=summary["frames"],
+            events=summary["events"],
+        )
+        self._capture_manifest_idx = None
         return summary
 
     def _write_capture(self, n: int, tracks: list, events: list):
-        rec = {"ts": round(time.time(), 2), "n": n, "tracks": tracks, "events": events}
+        rec = {
+            "run_id": self._run_id,
+            "ts": round(time.time(), 2),
+            "n": n,
+            "tracks": tracks,
+            "events": events,
+        }
         try:
             with open(self._capture_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
@@ -321,12 +483,15 @@ class ReceptionDaemon:
         with self._lock:
             if self._recording:  # don't clobber an in-progress recording's writer
                 return f"already recording -> {self._record_path} ({self._record_frames} frames so far)"
-            self._record_path = ARTIFACTS / f"video-{time.strftime('%H%M%S')}.mkv"
+            self._record_path = self._artifact_path("video", ".mkv")
             self._record_path.parent.mkdir(parents=True, exist_ok=True)
             self._record_writer = None  # lazy-created on first frame (needs w/h)
             self._record_frames = 0
             self._recording = True
-        fps = 1.0 / self._vision_interval if self._vision_interval else 5.0
+            fps = 1.0 / self._vision_interval if self._vision_interval else 5.0
+            self._record_manifest_idx = self._manifest_add_artifact(
+                "video", path=str(self._record_path), status="open", fps=round(fps, 2)
+            )
         log.info("record: started -> %s (~%.1f fps)", self._record_path, fps)
         return f"recording -> {self._record_path}  (vision must be ON; ~{fps:.1f} fps)"
 
@@ -339,6 +504,11 @@ class ReceptionDaemon:
         if writer is not None:
             writer.release()
         log.info("record: stopped (%s frames) -> %s", summary["frames"], summary["path"])
+        self._manifest_update_artifact(
+            "video", self._record_manifest_idx, status="closed",
+            ended_ts=round(time.time(), 3), frames=summary["frames"],
+        )
+        self._record_manifest_idx = None
         return summary
 
     def _write_video(self, frame):
@@ -494,7 +664,7 @@ class ReceptionDaemon:
             if self._brain_backend == "pydantic":
                 from reachy_mini_brain.brain import PydanticBrain
 
-                brain = PydanticBrain()
+                brain = PydanticBrain(model=self._brain_model)
                 log.info("voice: loading brain (pydantic-ai/openrouter, model=%s)", brain.model)
                 return brain
             from reachy_mini_brain.brain import ReceptionBrain
@@ -517,14 +687,21 @@ class ReceptionDaemon:
             d = ARTIFACTS / "turns"
             d.mkdir(parents=True, exist_ok=True)
             if self._turns_jsonl is None:
-                self._turns_jsonl = d / f"turns-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+                self._turns_jsonl = d / f"turns-{self._run_id}.jsonl"
+                self._turns_manifest_idx = self._manifest_add_artifact(
+                    "turns", path=str(self._turns_jsonl), status="open"
+                )
             self._turn_n += 1
-            wav = d / f"turn-{time.strftime('%H%M%S')}-{self._turn_n:03d}.wav"
+            wav = d / f"turn-{self._run_id}-{self._turn_n:03d}.wav"
             sf.write(str(wav), audio, 16000)
             rec = {"ts": time.time(), "n": self._turn_n, "dur": round(len(audio) / 16000.0, 2),
-                   "heard": heard, "reply": reply, "wav": wav.name}
+                   "heard": heard, "reply": reply, "wav": wav.name, "run_id": self._run_id}
             with open(self._turns_jsonl, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
+            self._manifest_update_artifact(
+                "turns", self._turns_manifest_idx, status="open",
+                turns=self._turn_n, latest_wav=str(wav),
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("save_turn error %s", e)
 
@@ -532,6 +709,8 @@ class ReceptionDaemon:
 
     def status(self) -> dict:
         st = {
+            "run_id": self._run_id,
+            "manifest": str(self._manifest_path),
             "vision": "on" if _alive(self._vision_thread) else "off",
             "voice": "on" if _alive(self._voice_thread) else "off",
         }
@@ -616,6 +795,33 @@ class ReceptionDaemon:
         except Exception:  # noqa: BLE001
             pass
 
+    # --- raw audio recording ---
+
+    def audio_record_on(self) -> dict:
+        """Start recording raw continuous mic audio (Cat-1) through the shared session mic loop."""
+        if self._audio_record_manifest_idx is not None:
+            return self._session.audio_record_start()
+        path = self._artifact_path("audio", ".wav")
+        self._audio_record_manifest_idx = self._manifest_add_artifact(
+            "audio", path=str(path), metadata=str(path.with_suffix(".jsonl")), status="open"
+        )
+        summary = self._session.audio_record_start(str(path), run_id=self._run_id)
+        log.info("audio_record: started -> %s", summary.get("path"))
+        return summary
+
+    def audio_record_off(self) -> dict:
+        """Stop raw continuous mic audio recording."""
+        summary = self._session.audio_record_stop()
+        log.info("audio_record: stopped (%s samples) -> %s",
+                 summary.get("samples"), summary.get("path"))
+        self._manifest_update_artifact(
+            "audio", self._audio_record_manifest_idx, status="closed",
+            ended_ts=round(time.time(), 3), samples=summary.get("samples"),
+            duration=summary.get("duration"), chunks=summary.get("chunks"),
+        )
+        self._audio_record_manifest_idx = None
+        return summary
+
 
 def _alive(t: threading.Thread | None) -> bool:
     return t is not None and t.is_alive()
@@ -629,7 +835,7 @@ def _alive(t: threading.Thread | None) -> bool:
 _COMMANDS = {"vision_on", "vision_off", "voice_on", "voice_off", "status", "react",
              "farewell", "reset", "wave_back", "start_conversation",
              "capture_on", "capture_off", "record_on", "record_off",
-             "stream_on", "stream_off"}
+             "stream_on", "stream_off", "audio_record_on", "audio_record_off"}
 
 
 def _send(conn: socket.socket, obj: dict):
@@ -674,7 +880,8 @@ def serve_daemon(mock: bool, vision_interval: float, voice_interval: float,
                  perception: bool = False, threshold: float = 0.5,
                  gestures: bool = False,
                  brain: bool = False, brain_model: str = "sonnet",
-                 brain_backend: str = "claude", save_turns: bool = False):
+                 brain_backend: str = "claude", save_turns: bool = False,
+                 run_id: str | None = None, log_path: Path | None = None):
     """Start the reception daemon + control socket (blocks until shutdown)."""
     if mock:
         session = MockSession()
@@ -689,6 +896,8 @@ def serve_daemon(mock: bool, vision_interval: float, voice_interval: float,
         perception=perception, threshold=threshold, gestures=gestures,
         brain=brain, brain_model=brain_model, brain_backend=brain_backend,
         save_turns=save_turns,
+        run_id=run_id,
+        log_path=log_path,
     )
 
     log.info("starting session%s...", " (mock)" if mock else "")
@@ -805,7 +1014,8 @@ def serve(mock, vision_interval, voice_interval, perception, threshold, gestures
     """Run the reception daemon (blocks until `shutdown` or Ctrl-C)."""
     # Durable log: the daemon owns a timestamped file under artifacts/logs/ (never /tmp,
     # which the OS cleans), in addition to stderr. Survives restarts; never overwritten.
-    logfile = ARTIFACTS / "logs" / f"reception-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    logfile = ARTIFACTS / "logs" / f"reception-{run_id}.log"
     logfile.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -814,8 +1024,10 @@ def serve(mock, vision_interval, voice_interval, perception, threshold, gestures
         handlers=[logging.StreamHandler(sys.stderr), logging.FileHandler(logfile)],
     )
     log.info("durable log -> %s", logfile)
+    log.info("run_id -> %s", run_id)
     serve_daemon(mock, vision_interval, voice_interval, perception, threshold,
-                 gestures, brain, brain_model, brain_backend, save_turns)
+                 gestures, brain, brain_model, brain_backend, save_turns,
+                 run_id=run_id, log_path=logfile)
 
 
 @cli.command()
@@ -874,6 +1086,13 @@ def capture(state):
 def record(state):
     """Record the camera to artifacts/video-*.mkv (needs vision on)."""
     _run_client(f"record_{state}")
+
+
+@cli.command("audio-record")
+@click.argument("state", type=click.Choice(["on", "off"]))
+def audio_record(state):
+    """Record raw mic audio to artifacts/audio-*.wav + .jsonl sidecar."""
+    _run_client(f"audio_record_{state}")
 
 
 @cli.command()

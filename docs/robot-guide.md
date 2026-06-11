@@ -161,9 +161,10 @@ reception wave                                     # wave ack   ("Hi there!" —
 reception reset                                    # head + body + antennas → neutral (no speech)
 
 # Data capture (vision must be ON)
-reception record  on | off                         # camera → artifacts/video-<ts>.mkv  (crash-resilient)
-reception capture on | off                         # per-frame tracks/events → artifacts/capture-<ts>.jsonl
+reception record  on | off                         # camera → artifacts/video-<run_id>-NN.mkv  (crash-resilient)
+reception capture on | off                         # per-frame tracks/events → artifacts/capture-<run_id>-NN.jsonl
 reception stream  on | off                         # live MJPEG on 127.0.0.1:8090 (view via ssh -L 8090:localhost:8090)
+reception audio-record on | off                    # raw mic audio → artifacts/audio-<run_id>-NN.wav + .jsonl sidecar
 
 reception shutdown                                 # graceful stop — finalizes record/capture, removes socket
 
@@ -187,12 +188,24 @@ python -m reachy_mini_brain.alert_engine --cooldown 5   # approach→react, depa
 
 ### Notes
 
-- **Durable log:** the daemon writes `artifacts/logs/reception-<ts>.log` (timestamped, survives
+- **Durable log:** the daemon writes `artifacts/logs/reception-<run_id>.log` (timestamped, survives
   restarts). Launch it detached with `nohup caffeinate -dimsu … &` on m1max so it doesn't sleep.
+- **Run manifest:** every `serve` process gets a `run_id` and writes
+  `artifacts/runs/run-<run_id>.json`, tying the durable log, shared `events.jsonl`,
+  video, capture, raw audio, and turn files together. `reception status` prints the
+  active `run_id` and manifest path.
 - **Recording is `.mkv`** (`mp4v` codec): a hard kill/battery-off keeps footage up to the crash
   (an `.mp4` would be unreadable without its trailing index). Graceful `shutdown`/`record off`
   finalizes cleanly either way.
+- **Raw audio recording:** `audio-record on` starts the shared mic loop and writes a 16 kHz mono
+  float WAV plus a JSONL timestamp sidecar. The sidecar has `ts`, sample offsets, chunk lengths,
+  RMS, and `speaking` flags so audio can be aligned with video/capture/events.
 - **One session only:** the daemon and the official Control app can't both hold the robot — stop
   one before the other.
 - Offline replay/eval of recorded clips: `python -m reachy_mini_brain.replay <clip> [--trace]
   [--smooth N] [--annotate out.mkv] [--expect-approach N --expect-depart N]`.
+- Offline audio review: `python -m reachy_mini_brain.review_audio <run_id> [--sync]
+  [--clips flagged|delayed|all|none]`. It validates the run, aligns turn WAVs against raw
+  audio, and writes review clips plus `review.md`/`review.csv`/`review.json` under
+  `artifacts/reviews/<run_id>/`. Use `--sync` to pull the run from m1max into
+  `artifacts/remote-runs/<run_id>/` first.

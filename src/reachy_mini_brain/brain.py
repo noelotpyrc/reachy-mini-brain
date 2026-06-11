@@ -182,6 +182,11 @@ class ReceptionBrain:
 _DEFAULT_OR_MODEL = os.environ.get("REACHY_BRAIN_MODEL", "openai/gpt-oss-20b")
 
 
+def default_openrouter_model() -> str:
+    """Model PydanticBrain will use when the caller does not pass one explicitly."""
+    return _DEFAULT_OR_MODEL
+
+
 def _openrouter_key() -> str:
     """OpenRouter key from env, falling back to the project `.env` (the daemon often launches
     without it exported)."""

@@ -17,7 +17,8 @@ DEFAULT_EVENTS_PATH = Path(__file__).resolve().parent.parent.parent / "artifacts
 
 class PerceptionPipeline:
     def __init__(self, events_path=DEFAULT_EVENTS_PATH, threshold: float = 0.5, smooth: int = 0,
-                 gestures: bool = False, gesture_cooldown: float = 3.0):
+                 gestures: bool = False, gesture_cooldown: float = 3.0,
+                 run_id: str | None = None):
         from reachy_mini_brain.detector import PersonDetector
 
         self._detector = PersonDetector(threshold=threshold)
@@ -30,6 +31,7 @@ class PerceptionPipeline:
         self._gesture_detector = None
         self._last_wave = 0.0
         self._events_path = Path(events_path)
+        self._run_id = run_id
         self._events_path.parent.mkdir(parents=True, exist_ok=True)
         # Pre-create the log so an alert engine that starts first (and seeks to end)
         # doesn't miss the very first event written when the file is created.
@@ -54,6 +56,8 @@ class PerceptionPipeline:
         for ev in events:
             rec = {"type": ev["kind"], "ts": round(time.time(), 3),
                    **{k: v for k, v in ev.items() if k != "kind"}}
+            if self._run_id:
+                rec["run_id"] = self._run_id
             with self._events_path.open("a") as f:
                 f.write(json.dumps(rec) + "\n")
         return events, len(persons), self._approach.frame_debug

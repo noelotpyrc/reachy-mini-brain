@@ -289,15 +289,18 @@ unblocked.
   events; not needed for the MVP. Phase B+.
 - **FAQ knowledge** — currently facts-in-persona (Haiku drifts); add an authoritative
   FAQ tool. Phase C polish.
-- **STT — VAD endpointing DONE; model replacement is the NEXT STT work.** (2026-06-09) Added a
+- **STT — VAD endpointing DONE; model replacement is the NEXT STT work.** (updated 2026-06-11)
+  Added a
   **Silero-VAD endpointer** so each turn is one clean utterance — fixed the fragment/15s-garble problem
   (live-validated); bumped to faster-whisper `medium`. But `medium` is **batch + ~2s/utterance** and
   still fumbles short/fast/mumbled speech → off replies, so **STT is now the bottleneck.** Replacement
-  candidates (detail + table in `voice-ai-research.md`): **(1) quick** `medium → large-v3-turbo`
-  (one-line, faster + more accurate); **(2) real fix** `parakeet-mlx` (NVIDIA Parakeet on Apple Silicon,
-  ~80 ms local, accurate, private); **(3) cloud** AssemblyAI (noise-robust + intelligent endpointing).
-  Also added **`--save-turns`** debug capture (per-turn WAV + heard/reply) to attribute off replies to
-  STT vs brain. *(My lean: try large-v3-turbo first, then parakeet-mlx.)*
+  candidates (detail + table in `voice-ai-research.md`): **(1) quick offline A/B** rerun faster-whisper
+  `medium` vs `large-v3` vs `large-v3-turbo` on the clearer Haiku review clips
+  (`20260610-145250-1a7624`, especially 03/04 split-turn + 05/06/13 transcript issues); do **not**
+  score STT quality on the choppy GPT-OSS run. **(2) real fix** `parakeet-mlx` (NVIDIA Parakeet on
+  Apple Silicon, ~80 ms local, accurate, private); **(3) cloud** AssemblyAI (noise-robust + intelligent
+  endpointing). Also added **`--save-turns`** debug capture (per-turn WAV + heard/reply) to attribute off
+  replies to STT vs brain. *(Current lean: try `large-v3-turbo` and `large-v3` first, then parakeet-mlx.)*
 - **Conversation STARTUP lag — the lag that matters.** The serious lag is **wave → reaction**
   (the opener / conversation init), NOT between turns — per-turn lag (~3s) is acceptable for a
   first pass. Startup ≈ ~4s: alert poll + opener TTS (synth + ~1.3s buffer cushion + ~2.5s
