@@ -2,6 +2,10 @@
 
 Full reference for all CLI commands. All commands run from project root.
 
+> **Bringing the reception robot up on m1max?** Follow [`runbook.md`](./runbook.md)
+> — the start-daemon + turn-on-reactions sequence (incl. the two setup steps that are
+> easy to miss: launch from the tmux session, and start the separate alert engine).
+
 ## Vision
 
 ```bash
