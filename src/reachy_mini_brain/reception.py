@@ -46,6 +46,11 @@ import click
 SOCKET_PATH = "/tmp/reachy_mini_reception.sock"
 ARTIFACTS = Path(__file__).resolve().parent.parent.parent / "artifacts"
 
+# Resting antenna pose (left, right) in degrees. Not (0, 0): the right antenna has a
+# mechanical issue at zero, so home is a gentle symmetric outward tilt. Tuned live via
+# the `antennas` command; used by reset() and every gesture's return-to-rest.
+NEUTRAL_ANTENNAS = (-15.0, -15.0)
+
 log = logging.getLogger("reception")
 
 
@@ -733,9 +738,16 @@ class ReceptionDaemon:
         """Reset head + body + antennas to a neutral 'home' pose (no speech/gesture)."""
         self._session.move_head(pitch=0.0, roll=0.0, yaw=0.0, duration=0.8)
         self._session.rotate_body(0.0, duration=0.8)
-        self._session.antennas(0.0, 0.0)
+        self._session.antennas(*NEUTRAL_ANTENNAS)
         log.info("reset: head/body/antennas to neutral")
         return "reset: head + body + antennas neutral"
+
+    def antennas(self, left: float = 0.0, right: float = 0.0) -> str:
+        """Set antenna angles directly (degrees, positive = up). For live calibration
+        of the resting pose; the value chosen here becomes NEUTRAL_ANTENNAS in code."""
+        self._session.antennas(float(left), float(right))
+        log.info("antennas -> left=%s right=%s", left, right)
+        return f"antennas: left={left} right={right}"
 
     def farewell(self) -> str:
         """Say goodbye to a departing visitor."""
@@ -765,7 +777,7 @@ class ReceptionDaemon:
         for action in (
             lambda: self._session.antennas(20, 20),
             lambda: self._session.speak(message, cache=True),
-            lambda: self._session.antennas(0, 0),
+            lambda: self._session.antennas(*NEUTRAL_ANTENNAS),
         ):
             try:
                 action()
@@ -791,7 +803,7 @@ class ReceptionDaemon:
             i += 1
             stop_evt.wait(0.3)
         try:
-            self._session.antennas(0, 0)
+            self._session.antennas(*NEUTRAL_ANTENNAS)
         except Exception:  # noqa: BLE001
             pass
 
@@ -835,7 +847,8 @@ def _alive(t: threading.Thread | None) -> bool:
 _COMMANDS = {"vision_on", "vision_off", "voice_on", "voice_off", "status", "react",
              "farewell", "reset", "wave_back", "start_conversation",
              "capture_on", "capture_off", "record_on", "record_off",
-             "stream_on", "stream_off", "audio_record_on", "audio_record_off"}
+             "stream_on", "stream_off", "audio_record_on", "audio_record_off",
+             "antennas"}
 
 
 def _send(conn: socket.socket, obj: dict):
@@ -856,6 +869,7 @@ def _handle(daemon: ReceptionDaemon, conn: socket.socket) -> bool:
 
         msg = json.loads(data.decode().strip())
         method = msg.get("method", "")
+        params = msg.get("params") or {}
 
         if method == "shutdown":
             _send(conn, {"ok": True, "result": "shutting down"})
@@ -864,7 +878,7 @@ def _handle(daemon: ReceptionDaemon, conn: socket.socket) -> bool:
             _send(conn, {"ok": False, "error": f"unknown command: {method}"})
             return True
 
-        result = getattr(daemon, method)()
+        result = getattr(daemon, method)(**params)
         _send(conn, {"ok": True, "result": result})
     except Exception as e:  # noqa: BLE001
         try:
@@ -944,12 +958,12 @@ def serve_daemon(mock: bool, vision_interval: float, voice_interval: float,
 # ---------------------------------------------------------------------------
 
 
-def _client(method: str, timeout: float = 30.0) -> dict:
+def _client(method: str, params: dict | None = None, timeout: float = 30.0) -> dict:
     """Send one control command to the running daemon."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     sock.connect(SOCKET_PATH)
-    sock.sendall((json.dumps({"method": method}) + "\n").encode())
+    sock.sendall((json.dumps({"method": method, "params": params or {}}) + "\n").encode())
     data = b""
     while b"\n" not in data:
         chunk = sock.recv(65536)
@@ -960,9 +974,9 @@ def _client(method: str, timeout: float = 30.0) -> dict:
     return json.loads(data.decode().strip())
 
 
-def _run_client(method: str):
+def _run_client(method: str, params: dict | None = None):
     try:
-        result = _client(method)
+        result = _client(method, params)
     except (FileNotFoundError, ConnectionRefusedError):
         click.echo(
             "Error: reception daemon not running. "
@@ -1054,6 +1068,14 @@ def react():
 def reset():
     """Reset the robot pose: head + body + antennas to neutral (no speech)."""
     _run_client("reset")
+
+
+@cli.command()
+@click.option("--left", type=float, required=True, help="Left antenna angle (deg, +=up)")
+@click.option("--right", type=float, required=True, help="Right antenna angle (deg, +=up)")
+def antennas(left, right):
+    """Set antenna angles directly (live calibration of the resting pose)."""
+    _run_client("antennas", {"left": left, "right": right})
 
 
 @cli.command()
